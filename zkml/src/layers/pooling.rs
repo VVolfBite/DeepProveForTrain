@@ -10,7 +10,7 @@ use crate::{
             verifier::verify_logup_proof,
         },
     },
-    quantization::{Fieldizer, IntoElement},
+    quantization::{Fieldizer, IntoElement, ZERO},
     tensor::Tensor,
 };
 use anyhow::{Context, ensure};
@@ -522,6 +522,72 @@ impl Maxpool2D {
 
         [even_diff, odd_diff].concat()
     }
+
+    /// 实现池化层的反向传播
+    /// 最大池化的反向传播规则:
+    /// - 只有在前向传播时被选中的最大值位置会传递梯度
+    /// - 其他位置的梯度为0
+    pub fn backward(
+        &self,
+        output_grad: &Tensor<Element>,
+        input: &Tensor<Element>,
+        cache: Option<&Tensor<Element>>, // 可以存储前向传播时的索引信息
+    ) -> Tensor<Element> {
+        assert!(
+            self.kernel_size == MAXPOOL2D_KERNEL_SIZE,
+            "Maxpool2D works only for kernel size {}",
+            MAXPOOL2D_KERNEL_SIZE
+        );
+        assert!(
+            self.stride == MAXPOOL2D_KERNEL_SIZE,
+            "Maxpool2D works only for stride size {}",
+            MAXPOOL2D_KERNEL_SIZE
+        );
+
+        let input_shape = input.get_shape();
+        let dims = input_shape.len();
+        let (h, w) = (input_shape[dims - 2], input_shape[dims - 1]);
+        
+        // 使用 *ZERO 来初始化梯度张量
+        let mut grad_input = vec![*ZERO; input.get_data().len()];
+
+        let outer_dims: usize = input_shape[..dims - 2].iter().product();
+        
+        // 对每个池化窗口计算梯度
+        for n in 0..outer_dims {
+            for i in 0..(h/self.kernel_size) {
+                for j in 0..(w/self.kernel_size) {
+                    // 获取当前输出梯度
+                    let out_idx = n * (h/self.kernel_size) * (w/self.kernel_size) + i * (w/self.kernel_size) + j;
+                    let out_grad = output_grad.get_data()[out_idx];
+
+                    // 找到最大值的位置
+                    let mut max_val = Element::MIN; // 这里也需要处理
+                    let mut max_i = 0;
+                    let mut max_j = 0;
+                    
+                    // 在池化窗口中寻找最大值位置
+                    for ki in 0..self.kernel_size {
+                        for kj in 0..self.kernel_size {
+                            let in_idx = n * h * w + (i * self.stride + ki) * w + (j * self.stride + kj);
+                            let val = input.get_data()[in_idx];
+                            if val > max_val {
+                                max_val = val;
+                                max_i = ki;
+                                max_j = kj;
+                            }
+                        }
+                    }
+
+                    // 将梯度传递给最大值位置
+                    let grad_idx = n * h * w + (i * self.stride + max_i) * w + (j * self.stride + max_j);
+                    grad_input[grad_idx] = out_grad;
+                }
+            }
+        }
+
+        Tensor::new(input_shape.clone(), grad_input)
+    }
 }
 
 #[cfg(test)]
@@ -794,5 +860,46 @@ mod tests {
 
             assert_eq!(mle_eval, maybe_eval);
         }
+    }
+
+    #[test]
+    fn test_maxpool_backward() {
+        let pool = Maxpool2D::default();
+        
+        // 创建测试输入
+        let input = Tensor::new(
+            vec![1, 1, 4, 4],
+            vec![
+                1, 2, 3, 4,
+                5, 6, 7, 8,
+                9, 10, 11, 12,
+                13, 14, 15, 16
+            ]
+        );
+
+        // 前向传播
+        let output = pool.op(&input);
+
+        // 创建输出梯度
+        let output_grad = Tensor::new(
+            vec![1, 1, 2, 2],
+            vec![1, 1, 1, 1]
+        );
+
+        // 执行反向传播
+        let input_grad = pool.backward(&output_grad, &input, None);
+
+        // 验证梯度形状
+        assert_eq!(input_grad.get_shape(), input.get_shape());
+
+        // 验证梯度值 - 只有最大值位置有梯度
+        let expected = vec![
+            0, 0, 0, 0,
+            0, 1, 0, 1,
+            0, 0, 0, 0,
+            0, 1, 0, 1
+        ];
+        
+        assert_eq!(input_grad.get_data(), expected);
     }
 }

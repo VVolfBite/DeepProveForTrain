@@ -270,6 +270,58 @@ impl Dense {
         });
         (dense_info, ctx_aux)
     }
+
+    pub fn backward(
+        &self,
+        output_grad: &Tensor<Element>,
+        input: &Tensor<Element>,
+    ) -> (Tensor<Element>, Tensor<Element>, Tensor<Element>) {
+        // 确保维度匹配
+        assert_eq!(output_grad.get_shape(), &[self.nrows()]);
+        let input_shape = input.get_shape();
+        let flat_input = if input_shape.len() != 1 {
+            input.flatten()
+        } else {
+            input.clone()
+        };
+        assert_eq!(flat_input.get_data().len(), self.ncols());
+
+        // 1. 计算输入梯度: dL/dx = (dL/dy) * W^T
+        let input_grad = self.matrix.transpose().matvec(output_grad);
+
+        // 2. 计算权重梯度: dL/dW = (dL/dy) * x^T
+        let weight_grad = Tensor::outer_product(output_grad, &flat_input);
+        assert_eq!(weight_grad.get_shape(), self.matrix.get_shape());
+
+        // 3. 计算偏置梯度: dL/db = dL/dy
+        let bias_grad = output_grad.clone();
+        assert_eq!(bias_grad.get_shape(), self.bias.get_shape());
+
+        // 如果输入是多维的,需要将输入梯度重塑回原始形状
+        let final_input_grad = if input_shape.len() != 1 {
+            input_grad.reshape(input_shape.clone())
+        } else {
+            input_grad
+        };
+
+        (final_input_grad, weight_grad, bias_grad)
+    }
+
+    /// 使用计算出的梯度更新参数
+    pub fn update_params(
+        &mut self,
+        weight_grad: &Tensor<Element>,
+        bias_grad: &Tensor<Element>,
+        learning_rate: Element,
+    ) {
+        // 更新权重
+        let scaled_weight_grad = weight_grad.scale(learning_rate);
+        self.matrix = self.matrix.sub(&scaled_weight_grad);
+
+        // 更新偏置
+        let scaled_bias_grad = bias_grad.scale(learning_rate);
+        self.bias = self.bias.sub(&scaled_bias_grad);
+    }
 }
 
 impl<E: ExtensionField> DenseCtx<E>
@@ -524,5 +576,101 @@ mod test {
                 assert_eq!(output.get_data()[i], padded_output.get_data()[i]);
             }
         }
+
+        #[test]
+        fn test_dense_backward() {
+            // 创建一个简单的Dense层
+            let matrix = Tensor::<Element>::matix_from_coeffs(vec![
+                vec![1, 2],
+                vec![3, 4],
+            ]).unwrap();
+            let bias = Tensor::<Element>::new(vec![2], vec![5, 6]);
+            let dense = Dense::new(matrix, bias);
+
+            // 创建输入和输出梯度
+            let input = Tensor::<Element>::new(vec![2], vec![1, 2]);
+            let output_grad = Tensor::<Element>::new(vec![2], vec![3, 4]);
+
+            // 执行反向传播
+            let (input_grad, weight_grad, bias_grad) = dense.backward(&output_grad, &input);
+
+            // 验证梯度形状
+            assert_eq!(input_grad.get_shape(), vec![2]);
+            assert_eq!(weight_grad.get_shape(), vec![2, 2]);
+            assert_eq!(bias_grad.get_shape(), vec![2]);
+
+            // 验证梯度计算
+            // 输入梯度: dL/dx = W^T * dL/dy
+            // [1 3] [3] = [1*3 + 3*4]   [15]
+            // [2 4] [4]   [3*3 + 4*4] = [22]
+            assert_eq!(input_grad.get_data()[0], Element::try_from(15).unwrap());
+            assert_eq!(input_grad.get_data()[1], Element::try_from(22).unwrap());
+
+            // 权重梯度: dL/dW = dL/dy * x^T
+            // [3] [1 2] = [3*1 3*2] = [3 6]
+            // [4]         [4*1 4*2]   [4 8]
+            assert_eq!(weight_grad.get_data()[0], Element::try_from(3).unwrap());
+            assert_eq!(weight_grad.get_data()[1], Element::try_from(6).unwrap());
+            assert_eq!(weight_grad.get_data()[2], Element::try_from(4).unwrap());
+            assert_eq!(weight_grad.get_data()[3], Element::try_from(8).unwrap());
+
+            // 偏置梯度与输出梯度相同
+            assert_eq!(bias_grad.get_data(), output_grad.get_data());
+        }
+    }
+
+    #[test]
+    fn test_dense_update_params() {
+        // 创建初始Dense层
+        let matrix = Tensor::<Element>::matix_from_coeffs(vec![
+            vec![1, 2],
+            vec![3, 4],
+        ]).unwrap();
+        let bias = Tensor::<Element>::new(vec![2], vec![5, 6]);
+        let mut dense = Dense::new(matrix, bias);
+    
+        // 创建梯度
+        let weight_grad = Tensor::<Element>::matix_from_coeffs(vec![
+            vec![1, 1],
+            vec![1, 1],
+        ]).unwrap();
+        let bias_grad = Tensor::<Element>::new(vec![2], vec![1, 1]);
+    
+        // 设置学习率 - 使用量化值
+        // 0.1 应该被量化到合适的整数范围
+        let learning_rate = Element::try_from(
+            (*quantization::MAX as f32 * 0.1) as i128
+        ).unwrap();
+    
+        // 更新参数
+        dense.update_params(&weight_grad, &bias_grad, learning_rate);
+    
+        // 验证更新后的参数
+        let expected_change = learning_rate; // 每个参数减少 learning_rate * 1
+        assert_eq!(
+            dense.matrix.get_data()[0],
+            Element::try_from(1 - expected_change).unwrap()
+        );
+        assert_eq!(
+            dense.matrix.get_data()[1],
+            Element::try_from(2 - expected_change).unwrap()
+        );
+        assert_eq!(
+            dense.matrix.get_data()[2],
+            Element::try_from(3 - expected_change).unwrap()
+        );
+        assert_eq!(
+            dense.matrix.get_data()[3],
+            Element::try_from(4 - expected_change).unwrap()
+        );
+    
+        assert_eq!(
+            dense.bias.get_data()[0],
+            Element::try_from(5 - expected_change).unwrap()
+        );
+        assert_eq!(
+            dense.bias.get_data()[1],
+            Element::try_from(6 - expected_change).unwrap()
+        );
     }
 }

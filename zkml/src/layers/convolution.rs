@@ -475,6 +475,75 @@ impl Convolution {
 
         Ok(final_claim)
     }
+
+    /// 实现卷积层的反向传播
+    pub fn backward(
+        &self,
+        output_grad: &Tensor<Element>,  // dL/dy
+        input: &Tensor<Element>,        // x 
+    ) -> (Tensor<Element>, Tensor<Element>, Tensor<Element>) {
+        let input_shape = input.get_shape();
+        let filter_shape = self.filter.get_shape();
+        
+        // 1. 计算输入梯度 dL/dx = rot180(W) * dL/dy
+        // 需要对每个输出通道分别计算，然后求和
+        let mut input_grads = Vec::new();
+        let rotated_kernel = self.filter.rotate_180();
+        
+        // 拆分kernel为每个输出通道
+        let kernel_size = rotated_kernel.get_data().len() / filter_shape[0];
+        for i in 0..filter_shape[0] {
+            // 提取当前输出通道的kernel和梯度
+            let start = i * kernel_size;
+            let end = start + kernel_size;
+            let kernel_slice = Tensor::new(
+                vec![1, filter_shape[2], filter_shape[3]], 
+                rotated_kernel.get_data()[start..end].to_vec()
+            );
+            
+            // 提取当前输出通道的梯度
+            let grad_start = i * output_grad.get_data().len() / filter_shape[0];
+            let grad_end = grad_start + output_grad.get_data().len() / filter_shape[0];
+            let grad_slice = Tensor::new(
+                vec![1, output_grad.get_shape()[1], output_grad.get_shape()[2]],
+                output_grad.get_data()[grad_start..grad_end].to_vec()
+            );
+            
+            // 计算当前通道的输入梯度
+            let grad = kernel_slice.conv_full(&grad_slice);
+            input_grads.push(grad);
+        }
+        
+        // 求和得到最终的输入梯度
+        let mut input_grad = input_grads[0].clone();
+        for grad in input_grads.iter().skip(1) {
+            input_grad = input_grad.add(grad);
+        }
+
+        // 2. 计算权重梯度 dL/dW = x * dL/dy (互相关)
+        let weight_grad = input.correlate(output_grad);
+
+        // 3. 计算偏置梯度 dL/db = sum(dL/dy)
+        let bias_grad = output_grad.sum_spatial();
+
+        (input_grad, weight_grad, bias_grad)
+    }
+
+    /// 使用计算出的梯度更新参数
+    pub fn update_params(
+        &mut self,
+        weight_grad: &Tensor<Element>,
+        bias_grad: &Tensor<Element>,
+        learning_rate: Element,
+    ) {
+        // 更新权重: W = W - learning_rate * dL/dW
+        let scaled_weight_grad = weight_grad.scale(learning_rate);
+        self.filter = self.filter.sub(&scaled_weight_grad);
+
+        // 更新偏置: b = b - learning_rate * dL/db
+        let scaled_bias_grad = bias_grad.scale(learning_rate);
+        self.bias = self.bias.sub(&scaled_bias_grad);
+    }
 }
 
 impl<E> ConvCtx<E>
@@ -767,5 +836,56 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_conv_backward() {
+        // 创建一个简单的卷积层
+        let kernel = Tensor::new(
+            vec![2, 1, 3, 3],  // [out_channels, in_channels, height, width]
+            vec![1, 0, -1,      // 第一个输出通道
+                 0, 1, 0,
+                 -1, 0, 1,
+                 
+                 -1, 0, 1,      // 第二个输出通道
+                 0, 1, 0,
+                 1, 0, -1]
+        );
+        let bias = Tensor::new(vec![2], vec![1, -1]);
+        let conv = Convolution::new(kernel, bias);
+
+        // 创建输入
+        let input = Tensor::new(
+            vec![1, 5, 5],  // [channels, height, width]
+            vec![1, 1, 1, 1, 1,
+                 1, 1, 1, 1, 1,
+                 1, 1, 1, 1, 1,
+                 1, 1, 1, 1, 1,
+                 1, 1, 1, 1, 1]
+        );
+
+        // 创建输出梯度
+        let output_grad = Tensor::new(
+            vec![2, 3, 3],  // [out_channels, height, width]
+            vec![1, 1, 1,   // 第一个输出通道
+                 1, 1, 1,
+                 1, 1, 1,
+                 
+                 1, 1, 1,   // 第二个输出通道
+                 1, 1, 1,
+                 1, 1, 1]
+        );
+
+        // 执行反向传播
+        let (input_grad, weight_grad, bias_grad) = conv.backward(&output_grad, &input);
+
+        // 验证梯度形状
+        assert_eq!(input_grad.get_shape(), input.get_shape(), "Input gradient shape mismatch");
+        assert_eq!(weight_grad.get_shape(), conv.filter.get_shape(), "Weight gradient shape mismatch");
+        assert_eq!(bias_grad.get_shape(), conv.bias.get_shape(), "Bias gradient shape mismatch");
+
+        // 验证偏置梯度
+        // 每个输出通道的梯度应该是9(3x3)
+        assert_eq!(bias_grad.get_data(), vec![9, 9]);
     }
 }

@@ -141,3 +141,108 @@ where
         Ok(())
     }
 }
+
+
+/*
+以下是对 context.rs 文件的整体结构和关键部分的总结：
+
+---
+
+### **1. 文件功能**
+该文件实现了零知识证明系统的上下文管理功能,主要包括：
+- 模型各层级信息的维护和管理
+- 权重承诺(Commitment)的处理
+- 查找表(Lookup Table)协议的上下文维护
+- 证明系统状态的追踪与转录
+
+---
+
+### **2. 关键部分**
+
+#### **核心数据结构**
+- **`TableCtx<E>`**
+  - 功能：存储查找表相关信息
+  - 字段：
+    - `poly_id: PolyID` - 多重性多项式ID
+    - `num_vars: usize` - 变量数量
+    - `table_commitment: BasefoldCommitment<E>` - 表承诺
+
+- **`Context<E: ExtensionField>`**
+  - 功能：全局上下文环境
+  - 字段：
+    - `steps_info: Vec<LayerCtx<E>>` - 模型层信息(反序)
+    - `weights: precommit::Context<E>` - 权重承诺上下文
+    - `lookup: LookupContext` - 查找表上下文
+
+- **`ContextAux`**
+  - 功能：上下文辅助信息
+  - 字段：
+    - `tables: BTreeSet<TableType>` - 表类型集合
+    - `last_output_shape: Vec<usize>` - 最后输出形状
+
+---
+
+#### **主要方法实现**
+- **`Context::generate`**
+  - 功能：生成证明系统上下文
+  - 参数：
+    - `model: &Model` - 输入模型
+    - `input_shape: Option<Vec<usize>>` - 可选输入形状
+  - 流程：
+    1. 初始化辅助上下文
+    2. 生成各层信息
+    3. 创建承诺上下文
+    4. 构建查找表上下文
+
+- **`Context::write_to_transcript`**
+  - 功能：将上下文信息写入转录器
+  - 实现：根据不同层类型写入对应信息
+  - 支持层类型：
+    - Dense
+    - Requant
+    - Activation
+    - Pooling
+    - Table
+    - Convolution
+    - SchoolBookConvolution
+
+---
+
+### **3. 优化特点**
+
+1. **内存管理**
+- 预分配向量容量
+- 使用引用避免不必要的复制
+```rust
+let mut step_infos = Vec::with_capacity(model.layer_count());
+```
+
+2. **日志追踪**
+- 分层级的日志记录
+- 详细的调试信息
+```rust
+debug!("Context : layer info generation ...");
+trace!("Context : {}-th layer {}info generation ...", id, layer.describe());
+```
+
+3. **错误处理**
+- 使用 Result 类型返回错误
+- 详细的错误信息和上下文
+
+---
+
+### **4. 安全性保证**
+
+1. **类型安全**
+- 泛型约束确保类型安全
+- 序列化/反序列化边界清晰
+
+2. **状态完整性**
+- 严格的层级顺序管理
+- 完整的上下文信息验证
+
+---
+
+### **5. 总结**
+context.rs 实现了一个完整的零知识证明系统上下文管理框架。它通过模块化的设计和严格的类型系统,确保了证明系统的可靠性和可维护性。该实现特别注重性能优化和调试便利性,为整个零知识证明系统提供了坚实的基础设施支持。
+*/

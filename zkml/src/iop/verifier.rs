@@ -314,3 +314,150 @@ where
     }
     Ok(())
 }
+
+/*
+让我为您分析 verifier.rs 文件：
+
+# verifier.rs 文件分析
+
+### **1. 文件功能**
+该文件实现了零知识证明系统的验证者(Verifier)核心逻辑，主要包括：
+- 神经网络推理结果的验证
+- 层级证明的验证
+- 查找表证明的验证
+- 输入/输出一致性检查
+
+### **2. 关键部分**
+
+#### **核心数据结构**
+
+##### **IO**
+```rust
+pub struct IO<E> {
+    input: Tensor<E>,    // 模型输入
+    output: Tensor<E>,   // 模型输出
+}
+```
+
+##### **Verifier**
+```rust
+pub(crate) struct Verifier<'a, E: ExtensionField, T: Transcript<E>> {
+    commit_verifier: precommit::CommitVerifier<E>,  // 承诺验证器
+    witness_verifier: precommit::CommitVerifier<E>, // 见证验证器
+    transcript: &'a mut T,                          // 转录器
+}
+```
+
+#### **主要验证流程**
+
+1. **初始化阶段**
+```rust
+fn verify(mut self, ctx: Context<E>, proof: Proof<E>, io: IO<E>) -> anyhow::Result<()> {
+    // 1. 写入转录信息
+    ctx.write_to_transcript(self.transcript)?;
+    
+    // 2. 生成查找相关挑战
+    let challenge_storage = if let Some((_, witness_context)) = proof.witness {
+        // ...
+    } else {
+        ChallengeStorage::default()
+    };
+}
+```
+
+2. **输出验证**
+```rust
+// 验证输出MLE评估值
+let output_mle = io.output.get_data().to_vec().into_mle();
+let computed_sum = output_mle.evaluate(&first_randomness);
+```
+
+3. **层级验证**
+```rust
+for proof_and_step in proof.steps.iter().zip(ctx.steps_info.iter()) {
+    output_claim = match proof_and_step {
+        (LayerProof::Activation(proof), LayerCtx::Activation(info)) => {
+            // 激活层验证
+        }
+        (LayerProof::Dense(proof), LayerCtx::Dense(info)) => {
+            // 全连接层验证
+        }
+        // ...其他层验证
+    }
+}
+```
+
+### **3. 安全性保证**
+
+1. **类型安全**
+```rust
+where
+    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField + Serialize + DeserializeOwned,
+```
+
+2. **一致性检查**
+```rust
+ensure!(
+    computed_randomized_input == given_randomized_input,
+    "input not valid from proof"
+);
+```
+
+3. **完整性验证**
+```rust
+ensure!(
+    final_num == E::ZERO,
+    "Final numerator was non-zero, got: {:?}",
+    final_num
+);
+```
+
+### **4. 优化特点**
+
+1. **错误处理**
+- 使用 anyhow 提供详细错误信息
+- 链式错误处理
+
+2. **日志追踪**
+```rust
+println!(
+    "VERIFIER: Proof Order: {:?}",
+    proof.steps.iter().map(|p| p.variant_name()).collect_vec()
+);
+```
+
+### **5. 主要功能函数**
+
+1. **verify_table**
+```rust
+fn verify_table<E: ExtensionField, T: Transcript<E>>(
+    proof: &TableProof<E>,
+    table_type: TableType,
+    poly_id: usize,
+    witness_verifier: &mut commit::precommit::CommitVerifier<E>,
+    t: &mut T,
+    constant_challenge: E,
+    column_separation_challenge: E,
+) -> anyhow::Result<()>
+```
+
+2. **公共验证接口**
+```rust
+pub fn verify<E: ExtensionField, T: Transcript<E>>(
+    ctx: Context<E>,
+    proof: Proof<E>,
+    io: IO<E>,
+    transcript: &mut T,
+) -> anyhow::Result<()>
+```
+
+### **6. 总结**
+
+verifier.rs 实现了完整的零知识证明验证系统，通过:
+- 严格的类型系统
+- 完善的错误处理
+- 多层级验证机制
+- 查找表验证
+
+确保了神经网络推理结果的可验证性和安全性。该实现为零知识证明系统提供了可靠的验证基础设施。 */

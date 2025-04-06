@@ -20,7 +20,7 @@ use transcript::Transcript;
 
 use crate::{
     Element,
-    quantization::{self, BIT_LEN, Fieldizer},
+    quantization::{self, BIT_LEN, Fieldizer, ZERO},
     tensor::Tensor,
 };
 
@@ -204,6 +204,33 @@ impl Relu {
     pub fn apply(e: Element) -> Element {
         if e.is_negative() { 0 } else { e }
     }
+
+    /// 实现ReLU的反向传播
+    /// ReLU导数: 1 if x > 0, 0 otherwise
+    pub fn backward(
+        &self,
+        output_grad: &Tensor<Element>,
+        input: &Tensor<Element>
+    ) -> Tensor<Element> {
+        // 确保维度匹配
+        assert_eq!(output_grad.get_shape(), input.get_shape());
+        
+        // 计算ReLU的导数
+        let derivative = input.get_data()
+            .iter()
+            .map(|&x| (x > *ZERO) as Element)  // 使用更简洁的写法
+            .collect::<Vec<_>>();
+
+        // 计算输入梯度: dL/dx = dL/dy * relu'(x)
+        Tensor::new(
+            input.get_shape().clone(),
+            output_grad.get_data()
+                .iter()
+                .zip(derivative.iter())
+                .map(|(&grad, &deriv)| grad * deriv)
+                .collect()
+        )
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +300,29 @@ mod test {
             assert_eq!(output_field, expected_ofield);
         }
         // assert_eq!(expected,given);
+    }
+
+    #[test]
+    fn test_relu_backward() {
+        let relu = Relu::new();
+
+        // 测试用例1: 正数输入
+        let input1 = Tensor::new(vec![3], vec![1, 2, 3]);
+        let output_grad1 = Tensor::new(vec![3], vec![1, 1, 1]);
+        let input_grad1 = relu.backward(&output_grad1, &input1);
+        
+        // 正数输入，导数应该为1
+        assert_eq!(input_grad1.get_data(), vec![1, 1, 1]);
+
+        // 测试用例2: 混合输入
+        let input2 = Tensor::new(vec![3], vec![-1, 0, 1]);
+        let output_grad2 = Tensor::new(vec![3], vec![2, 2, 2]);
+        let input_grad2 = relu.backward(&output_grad2, &input2);
+        
+        // 负数和零的导数为0，正数的导数为1
+        assert_eq!(
+            input_grad2.get_data(),
+            vec![0, 0, 2] // -1 -> 0, 0 -> 0, 1 -> 2(=2*1)
+        );
     }
 }

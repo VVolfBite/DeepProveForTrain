@@ -800,7 +800,7 @@ mod tests {
         let model = load_model::<Element>(&filepath).unwrap();
         let input = crate::tensor::Tensor::random(vec![model.input_shape()[0]]);
         let input = model.prepare_input(input);
-        let trace = model.run::<F>(input.clone());
+        let trace = model.run_feedforward::<F>(input.clone());
         println!("Result: {:?}", trace.final_output());
     }
 
@@ -856,7 +856,7 @@ mod tests {
         info!("random input tensor CREATED : {:?}", input.get_shape());
         let input = model.prepare_input(input);
         info!("RUNNING MODEL...");
-        let trace = model.run::<F>(input.clone());
+        let trace = model.run_feedforward::<F>(input.clone());
         info!("RUNNING MODEL DONE...");
         // println!("Result: {:?}", trace.final_output());
 
@@ -896,7 +896,7 @@ mod tests {
         let model = result.unwrap();
         let input = crate::tensor::Tensor::random(model.input_shape());
         let input = model.prepare_input(input);
-        let trace = model.run::<F>(input.clone());
+        let trace = model.run_feedforward::<F>(input.clone());
         // println!("Result: {:?}", trace.final_output());
 
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
@@ -913,3 +913,109 @@ mod tests {
         verify::<_, _>(ctx, proof, io, &mut verifier_transcript).unwrap();
     }
 }
+
+/*
+以下是对 onnx_parse.rs 文件的整体结构和关键部分的总结：
+
+---
+
+### **1. 文件功能**
+该文件主要用于解析 ONNX（Open Neural Network Exchange）模型，提供了以下功能：
+- 支持 MLP（多层感知机）和 CNN（卷积神经网络）模型的解析和验证。
+- 提取模型的权重范围，用于量化。
+- 加载模型并构建计算图。
+- 提供辅助函数检查输入、过滤器形状等。
+
+---
+
+### **2. 关键函数**
+#### **模型解析与验证**
+- **`is_mlp(filepath: &str) -> Result<bool>`**
+  - 功能：判断给定的 ONNX 模型是否符合 MLP（多层感知机）的结构。
+  - 逻辑：
+    1. 遍历计算图中的节点。
+    2. 检查是否仅包含支持的操作（如 `Gemm` 和 `Relu`）。
+    3. 确保全连接层和激活层交替出现。
+  - 返回：布尔值，表示是否为 MLP。
+
+- **`is_cnn(filepath: &str) -> Result<bool>`**
+  - 功能：判断给定的 ONNX 模型是否符合 CNN（卷积神经网络）的结构。
+  - 逻辑：
+    1. 遍历计算图中的节点。
+    2. 检查是否仅包含支持的操作（如 `Conv`、`MaxPool` 和 `Relu`）。
+    3. 确保卷积层出现在全连接层之前。
+  - 返回：布尔值，表示是否为 CNN。
+
+- **`ModelType` 枚举**
+  - 定义：`MLP` 和 `CNN` 两种模型类型。
+  - 方法：
+    - **`validate(&self, filepath: &str) -> Result<()>`**：验证模型是否符合指定类型。
+    - **`from_onnx(filepath: &str) -> Result<ModelType>`**：根据 ONNX 文件自动检测模型类型。
+
+---
+
+#### **权重范围分析**
+- **`analyze_model_weight_ranges(filepath: &str) -> Result<(f32, f32)>`**
+  - 功能：分析支持的层（如 Dense 和 Conv2D）的权重范围，返回全局最小值和最大值。
+  - 逻辑：
+    1. 加载 ONNX 模型并解析计算图。
+    2. 构建权重初始化器的映射表。
+    3. 遍历计算图中的节点，提取权重和偏置的最小值和最大值。
+    4. 返回全局范围。
+  - 返回：`(f32, f32)`，表示全局最小值和最大值。
+
+- **`extract_node_weight_range(weight_or_bias: &str, node: &NodeProto, initializers: &HashMap<String, Tensor>) -> Result<Option<(f32, f32)>>`**
+  - 功能：提取指定节点的权重或偏置的最小值和最大值。
+  - 返回：`Option<(f32, f32)>`，表示最小值和最大值。
+
+---
+
+#### **模型加载**
+- **`load_model<Q: Quantizer<Element>>(filepath: &str) -> Result<Model>`**
+  - 功能：加载 ONNX 模型并构建计算图。
+  - 逻辑：
+    1. 验证模型类型（MLP 或 CNN）。
+    2. 提取全局权重范围。
+    3. 遍历计算图中的节点，逐层构建模型。
+    4. 返回构建的模型对象。
+  - 返回：`Model` 对象。
+
+---
+
+#### **辅助函数**
+- **`create_tensor(shape: Vec<usize>, dt: DatumType, data: &[u8]) -> TractResult<Tensor>`**
+  - 功能：根据形状、数据类型和原始数据创建 Tract 张量。
+  - 支持的数据类型包括 `u8`、`i32`、`f32` 等。
+
+- **`model_input_shape(graph: &GraphProto) -> Vec<usize>`**
+  - 功能：解析计算图的输入张量形状。
+  - 返回：输入形状的向量。
+
+- **`check_filter(filter_shape: &[usize]) -> Result<bool>`**
+  - 功能：检查过滤器的形状是否符合 CNN 要求（如 4D 张量且为正方形）。
+
+- **`check_cnn_input(input_shape: &[usize]) -> Result<bool>`**
+  - 功能：检查输入张量的形状是否符合 CNN 要求（如 3D 张量且为正方形）。
+
+- **`conv2d_shape(input_shape: &[usize], filter_shape: &[usize]) -> Vec<usize>`**
+  - 功能：计算卷积操作的输出形状。
+
+- **`maxpool2d_shape(input_shape: &[usize]) -> Vec<usize>`**
+  - 功能：计算最大池化操作的输出形状。
+
+---
+
+### **3. 测试**
+文件包含多个单元测试，验证核心功能：
+- **`test_load_mlp`**：测试 MLP 模型的加载。
+- **`test_mlp_model_run`**：测试 MLP 模型的运行。
+- **`test_is_cnn`**：测试 CNN 模型的验证。
+- **`test_load_cnn`**：测试 CNN 模型的加载。
+- **`test_quantize`**：测试量化功能。
+- **`test_covid_cnn`**（忽略测试）：测试特定 CNN 模型的加载和运行。
+
+---
+
+### **4. 总结**
+该文件的核心功能是解析和验证 ONNX 模型，支持 MLP 和 CNN 两种架构。它提供了权重范围分析、模型加载和辅助工具函数，适用于量化和深度学习模型的验证场景。
+*/

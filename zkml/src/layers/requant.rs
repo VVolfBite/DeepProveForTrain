@@ -395,3 +395,148 @@ impl RequantCtx {
         Ok(Claim { point, eval })
     }
 }
+
+/*
+# requant.rs 文件分析
+
+### 1. 主要数据结构
+
+#### Requant 结构体
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Copy, PartialOrd, Ord, Hash)]
+pub struct Requant {
+    pub right_shift: usize,    // 需要应用的右移量
+    pub range: usize,          // 输入值的范围
+    pub after_range: usize,    // 重量化后的目标范围
+}
+```
+
+#### RequantCtx 结构体
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RequantCtx {
+    pub requant: Requant,      // 重量化参数
+    pub poly_id: PolyID,       // 多项式ID
+    pub num_vars: usize,       // 变量数量
+}
+```
+
+### 2. 核心功能实现
+
+#### 重量化操作
+```rust
+impl Requant {
+    #[inline(always)]
+    pub fn apply(&self, e: &Element) -> Element {
+        let max_bit = (self.range << 1) as i128;
+        let tmp = e + max_bit;
+        let tmp = tmp >> self.right_shift;
+        tmp - (max_bit >> self.right_shift)
+    }
+}
+```
+
+### 3. 证明系统
+
+#### 证明生成
+```rust
+pub(crate) fn prove_step<E: ExtensionField, T: Transcript<E>>(
+    &self,
+    prover: &mut Prover<E, T>,
+    last_claim: &Claim<E>,
+    output: &[E],
+    requant_info: &RequantCtx,
+) -> anyhow::Result<Claim<E>>
+```
+
+#### 证明验证
+```rust
+pub(crate) fn verify_requant<E: ExtensionField, T: Transcript<E>>(
+    &self,
+    verifier: &mut Verifier<E, T>,
+    last_claim: Claim<E>,
+    proof: &RequantProof<E>,
+    constant_challenge: E,
+    column_separation_challenge: E,
+) -> anyhow::Result<Claim<E>>
+```
+
+### 4. 主要工具函数
+
+#### MLE 转换
+```rust
+pub fn to_mle<E: ExtensionField>(&self) -> Vec<E> {
+    let min_range = -(self.after_range as Element) / 2;
+    let max_range = (self.after_range as Element) / 2 - 1;
+    (min_range..=max_range)
+        .map(|i| i.to_field())
+        .collect::<Vec<E>>()
+}
+```
+
+#### 查找表生成
+```rust
+pub fn gen_lookup_witness<E: ExtensionField>(
+    &self,
+    input: &[Element],
+) -> (Vec<Element>, Vec<Vec<E::BaseField>>)
+```
+
+### 5. 优化特点
+
+1. **性能优化**
+```rust
+#[inline(always)]
+pub fn apply(&self, e: &Element) -> Element
+```
+
+2. **断言检查**
+```rust
+debug_assert_eq!(remainder_vals, 0);
+```
+
+### 6. 关键算法
+
+#### 重组声明
+```rust
+pub fn recombine_claims<E>(&self, eval_claims: &[E]) -> E 
+where
+    E: From<u64> + Default + Add<Output = E> + Mul<Output = E> + Sub<Output = E> + Copy,
+{
+    let max_bit = self.range << 1;
+    let subtract = max_bit >> self.right_shift;
+    // ...重组逻辑
+}
+```
+
+### 7. 总结
+
+requant.rs 实现了神经网络中的重量化层的零知识证明系统:
+
+1. **功能完备性**
+- 支持任意范围的量化
+- 可配置的右移量
+- 精确的范围控制
+
+2. **证明系统特点**
+- 高效的证明生成
+- 完整的验证机制
+- 良好的安全保证
+
+3. **性能考虑**
+- 内联关键函数
+- 使用位运算优化
+- Debug断言确保正确性
+
+4. **错误处理**
+- 使用Result返回类型
+- 详细的错误信息
+- 完善的错误传播
+
+5. **代码质量**
+- 清晰的类型约束
+- 完整的文档注释
+- 模块化的设计
+
+该实现为深度学习模型中的重量化操作提供了可验证计算支持。
+*/

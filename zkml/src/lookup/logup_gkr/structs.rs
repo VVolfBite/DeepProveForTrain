@@ -389,3 +389,207 @@ impl<E: ExtensionField> LogUpVerifierClaim<E> {
         &self.denominators
     }
 }
+
+/*
+# structs.rs 文件分析
+
+## 1. 核心数据结构
+
+### Fraction 分数结构
+```rust
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Fraction<F> {
+    pub numerator: F,      // 分子
+    pub denominator: F,    // 分母
+}
+```
+
+### LogUpInput 枚举
+```rust
+#[derive(Clone, Debug)]
+pub enum LogUpInput<E: ExtensionField> {
+    Lookup {
+        column_evals: Vec<Vec<E::BaseField>>,
+        constant_challenge: E,
+        column_separation_challenge: E,
+        columns_per_instance: usize,
+    },
+    Table {
+        column_evals: Vec<Vec<E::BaseField>>,
+        multiplicities: Vec<E::BaseField>,
+        constant_challenge: E,
+        column_separation_challenge: E,
+    },
+}
+```
+
+## 2. 优化建议
+
+### 1. 分数运算优化
+````rust
+impl<F: ExtensionField> Fraction<F> {
+    #[inline(always)]
+    pub fn simplify(&mut self) {
+        if self.denominator == F::ZERO {
+            panic!("除数不能为零");
+        }
+        if self.numerator == F::ZERO {
+            self.denominator = F::ONE;
+            return;
+        }
+        // 如果可能的话进行约分
+        // TODO: 实现GCD算法进行约分
+    }
+    
+    #[inline(always)]
+    pub fn reciprocal(&self) -> Option<Self> {
+        if self.numerator == F::ZERO {
+            None
+        } else {
+            Some(Fraction {
+                numerator: self.denominator.clone(),
+                denominator: self.numerator.clone(),
+            })
+        }
+    }
+}
+````
+
+### 2. 并行处理优化
+````rust
+impl<E: ExtensionField> LogUpInput<E> {
+    pub fn base_mles_parallel(&self) -> Vec<DenseMultilinearExtension<E>> {
+        match self {
+            LogUpInput::Lookup { column_evals, .. } => {
+                column_evals.par_iter()
+                    .map(|evaluations| {
+                        let num_vars = evaluations.len().ilog2() as usize;
+                        DenseMultilinearExtension::<E>::from_evaluations_slice(
+                            num_vars, 
+                            evaluations
+                        )
+                    })
+                    .collect()
+            },
+            // ...existing code...
+        }
+    }
+}
+````
+
+### 3. 错误处理优化
+````rust
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum FractionError {
+    #[error("分母为零")]
+    DivisionByZero,
+    
+    #[error("运算溢出")]
+    Overflow,
+}
+
+impl<F: ExtensionField> Fraction<F> {
+    pub fn checked_add(&self, rhs: &Self) -> Result<Self, FractionError> {
+        if rhs.denominator == F::ZERO || self.denominator == F::ZERO {
+            return Err(FractionError::DivisionByZero);
+        }
+        // ...existing code...
+        Ok(result)
+    }
+}
+````
+
+## 3. 测试完善
+
+````rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use goldilocks::GoldilocksExt2;
+
+    #[test]
+    fn test_fraction_basic_operations() {
+        let f1 = Fraction::<GoldilocksExt2>::new(
+            GoldilocksExt2::ONE,
+            GoldilocksExt2::ONE
+        );
+        let f2 = Fraction::<GoldilocksExt2>::new(
+            GoldilocksExt2::ONE,
+            GoldilocksExt2::ONE * GoldilocksExt2::from(2u64)
+        );
+        
+        // 测试加法
+        let sum = f1 + f2;
+        assert!(!sum.is_zero());
+        
+        // 测试乘法
+        let product = f1 * f2;
+        assert!(!product.is_zero());
+    }
+    
+    #[test]
+    fn test_logup_input_validation() {
+        let column_evals = vec![vec![GoldilocksExt2::ONE; 4]];
+        let result = LogUpInput::new_lookup(
+            column_evals.clone(),
+            GoldilocksExt2::ONE,
+            GoldilocksExt2::ONE,
+            1
+        );
+        assert!(result.is_ok());
+        
+        // 测试非2次幂长度的输入
+        let invalid_evals = vec![vec![GoldilocksExt2::ONE; 3]];
+        let result = LogUpInput::new_lookup(
+            invalid_evals,
+            GoldilocksExt2::ONE,
+            GoldilocksExt2::ONE,
+            1
+        );
+        assert!(result.is_err());
+    }
+}
+````
+
+## 4. 性能监控
+
+````rust
+use tracing::{debug, instrument};
+
+impl<E: ExtensionField> LogUpInput<E> {
+    #[instrument(skip(column_evals, constant_challenge, column_separation_challenge))]
+    pub fn new_lookup(
+        column_evals: Vec<Vec<E::BaseField>>,
+        constant_challenge: E,
+        column_separation_challenge: E,
+        columns_per_instance: usize,
+    ) -> Result<LogUpInput<E>, LogUpError> {
+        debug!("Creating new lookup input with {} columns", column_evals.len());
+        // ...existing code...
+    }
+}
+````
+
+## 5. 总结
+
+structs.rs 实现了 LogUp GKR 电路的基础数据结构：
+
+1. **核心功能**
+- 分数运算支持
+- 输入类型封装
+- 证明数据管理
+
+2. **优化建议**
+- 添加分数运算优化
+- 实现并行处理
+- 改进错误处理
+- 增加性能监控
+
+3. **代码质量**
+- 完善的测试覆盖
+- 清晰的错误处理
+- 良好的文档注释
+
+该实现为 LogUp GKR 电路提供了坚实的数据结构基础。 */

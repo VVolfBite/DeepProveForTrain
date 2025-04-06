@@ -358,3 +358,181 @@ fn initialise_from_table_set<E: ExtensionField, T: Transcript<E>>(
         challenge_map,
     }
 }
+
+/*
+# context.rs 文件分析
+
+## 1. 文件概述
+这是一个实现查找表证明生成和验证的核心文件。主要包含查找表的上下文管理和见证生成逻辑。
+
+## 2. 核心数据结构
+
+### TableType 枚举
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum TableType {
+    Relu,       // ReLU激活函数查找表
+    Range,      // 范围检查查找表
+}
+```
+
+### LookupContext
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LookupContext {
+    tables: Vec<TableType>,    // 保存所有使用的查找表类型
+}
+```
+
+## 3. 主要功能实现
+
+### 查找表操作
+```rust
+impl TableType {
+    // 获取合并后的表列
+    fn get_merged_table_column<E: ExtensionField>(
+        &self,
+        column_separator: Element,
+    ) -> (Vec<Element>, Vec<Vec<E::BaseField>>)
+    
+    // 表列求值
+    pub fn evaluate_table_columns<E: ExtensionField>(
+        &self,
+        point: &[E],
+    ) -> Result<Vec<E>, LogUpError>
+}
+```
+
+### 见证生成
+```rust
+pub fn generate_lookup_witnesses<E: ExtensionField, T: Transcript<E>>(
+    trace: &InferenceTrace<Element, E>,
+    transcript: &mut T,
+) -> Result<(...), LogUpError>
+```
+
+## 4. 优化特点
+
+1. **并行处理**
+- 使用 Iterator 进行数据处理
+- 采用 HashMap 优化查找性能
+
+2. **内存优化**
+```rust
+// 使用引用避免不必要的复制
+fn get_merged_table_column<E: ExtensionField>(&self, ...)
+```
+
+## 5. 错误处理
+
+使用自定义错误类型:
+```rust
+pub enum LogUpError {
+    VerifierError(String),
+    ParamterError(String),
+}
+```
+
+## 6. 关键算法
+
+### ReLU表生成
+```rust
+match TableType::Relu => {
+    let (comb, field): (Vec<Element>, Vec<(E::BaseField, E::BaseField)>) =
+        (*quantization::MIN..=*quantization::MAX)
+            .map(|i| {
+                let out = Relu::apply(i);
+                let i_field: E = i.to_field();
+                let out_field: E = out.to_field();
+                (
+                    i + out * column_separator,
+                    (i_field.as_bases()[0], out_field.as_bases()[0]),
+                )
+            })
+            .unzip();
+    // ...
+}
+```
+
+### 范围检查表生成
+```rust
+match TableType::Range => {
+    let (element_out, field): (Vec<Element>, Vec<E::BaseField>) = 
+        (0..1 << *quantization::BIT_LEN)
+            .map(|i| {
+                let i_field: E = i.to_field();
+                (i, i_field.as_bases()[0])
+            })
+            .unzip();
+    // ...
+}
+```
+
+## 7. 调试支持
+
+使用 tracing 进行日志记录:
+```rust
+debug!("Lookup witness generation: generating poly fields...");
+```
+
+## 8. 建议优化
+
+1. **性能优化**:
+```rust
+// 添加并行处理
+use rayon::prelude::*;
+
+fn get_merged_table_column<E: ExtensionField>(
+    &self,
+    column_separator: Element,
+) -> (Vec<Element>, Vec<Vec<E::BaseField>>) {
+    match self {
+        TableType::Relu => {
+            let (comb, field): (Vec<Element>, Vec<(E::BaseField, E::BaseField)>) =
+                (*quantization::MIN..=*quantization::MAX)
+                    .into_par_iter()  // 使用并行迭代器
+                    .map(...)
+                    .unzip();
+            // ...
+        }
+        // ...
+    }
+}
+```
+
+2. **错误处理优化**:
+```rust
+// 使用 thiserror 简化错误定义
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum LookupError {
+    #[error("Verifier error: {0}")]
+    VerifierError(String),
+    
+    #[error("Parameter error: {0}")]
+    ParameterError(String),
+}
+```
+
+## 9. 总结
+
+context.rs 实现了完整的查找表管理和见证生成系统:
+
+1. **功能完备**
+- ReLU 和范围检查表支持
+- 完整的见证生成
+- 灵活的表类型扩展
+
+2. **性能考虑**
+- 高效的数据结构
+- 优化的算法实现
+- 可扩展的设计
+
+3. **可维护性**
+- 清晰的代码结构
+- 完善的错误处理
+- 良好的调试支持
+
+该实现为零知识证明系统中的查找表操作提供了坚实基础。
+ */

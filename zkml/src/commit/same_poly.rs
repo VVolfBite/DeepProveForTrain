@@ -237,3 +237,123 @@ mod test {
         Ok(())
     }
 }
+
+/*
+让我为您分析 same_poly.rs 文件：
+
+# same_poly.rs 文件分析
+
+### **1. 文件功能**
+该文件实现了针对同一多项式的多个声明的证明系统，主要功能包括：
+- 对同一多项式的多个评估点进行批量证明
+- 使用 Sumcheck 协议进行验证
+- Beta 向量的计算和验证
+
+### **2. 关键部分**
+
+#### **核心数据结构**
+
+##### **Context**
+```rust
+pub struct Context<E: ExtensionField> {
+    vp_info: VPAuxInfo<E>,
+}
+```
+- 功能：存储验证所需的上下文信息
+- 主要包含虚拟多项式的辅助信息
+
+##### **Proof**
+```rust
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Proof<E: ExtensionField> {
+    sumcheck: IOPProof<E>,
+    evals: Vec<E>,  // [0]为beta评估，[1]为多项式评估
+}
+```
+
+#### **核心组件**
+
+##### **Prover（证明者）**
+```rust
+pub struct Prover<E: ExtensionField> {
+    claims: Vec<Claim<E>>,
+    poly: DenseMultilinearExtension<E>,
+}
+```
+主要方法：
+- `new()`: 创建新的证明者实例
+- `add_claim()`: 添加待证明的声明
+- `prove()`: 生成证明
+
+##### **Verifier（验证者）**
+```rust
+pub struct Verifier<'a, E: ExtensionField> {
+    claims: Vec<Claim<E>>,
+    ctx: &'a Context<E>,
+}
+```
+主要方法：
+- `new()`: 创建新的验证者实例
+- `add_claim()`: 添加待验证的声明
+- `verify()`: 验证证明
+
+### **3. 关键算法流程**
+
+#### **证明生成流程**
+1. 读取随机挑战值
+2. 计算 Beta 评估值
+3. 合并 Beta 向量
+4. 运行 Sumcheck 协议
+5. 生成最终证明
+
+```rust
+pub fn prove<T: Transcript<E>>(self, ctx: &Context<E>, t: &mut T) -> anyhow::Result<Proof<E>> {
+    let challenges = t.read_challenges(self.claims.len());
+    // ...计算beta评估值
+    // ...运行sumcheck
+    Ok(Proof {
+        sumcheck: sumcheck_proof,
+        evals: state.get_mle_final_evaluations(),
+    })
+}
+```
+
+#### **验证流程**
+1. 验证 Sumcheck 证明
+2. 验证 Beta 评估值
+3. 验证最终评估结果
+
+### **4. 优化特点**
+
+1. **并行计算**
+```rust
+let beta_evals = challenges
+    .into_par_iter()
+    .zip(self.claims.into_par_iter())
+    .map(|(a_i, c_i)| {
+        // ...并行计算beta评估值
+    })
+    .collect::<Vec<_>>();
+```
+
+2. **内存优化**
+- 使用迭代器避免不必要的内存分配
+- 合理使用所有权系统
+
+### **5. 测试用例**
+
+```rust
+#[test]
+fn test_same_poly_proof() -> anyhow::Result<()> {
+    // 测试完整的证明-验证流程
+}
+
+#[test]
+fn test_pcs() {
+    // 测试多项式承诺方案的基本功能
+}
+```
+
+### **6. 总结**
+same_poly.rs 实现了一个高效的批量证明系统，允许对同一多项式的多个评估点进行批量证明和验证。该实现结合了 Sumcheck 协议和 Beta 向量技术，通过并行计算优化性能，为零知识证明系统提供了重要的基础设施。
+ */

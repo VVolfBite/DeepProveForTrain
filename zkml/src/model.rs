@@ -79,7 +79,7 @@ impl Model {
         }
     }
 
-    pub fn run<'a, E: ExtensionField>(
+    pub fn run_feedforward<'a, E: ExtensionField>(
         &'a self,
         input: Tensor<Element>,
     ) -> InferenceTrace<'a, Element, E> {
@@ -408,7 +408,7 @@ pub(crate) mod test {
     #[test]
     fn test_model_long() {
         let (model, input) = Model::random(3);
-        model.run::<F>(input);
+        model.run_feedforward::<F>(input);
     }
 
     pub fn check_tensor_consistency_field<E: ExtensionField>(
@@ -503,7 +503,7 @@ pub(crate) mod test {
 
         let input = Tensor::new(vec![1, 32, 32], random_vector_quant(1024));
         let trace: crate::model::InferenceTrace<'_, _, GoldilocksExt2> =
-            model.run::<F>(input.clone());
+            model.run_feedforward::<F>(input.clone());
 
         let mut model2 = Model::new();
         model2.add_layer::<F>(Layer::SchoolBookConvolution(Convolution::new(
@@ -515,7 +515,7 @@ pub(crate) mod test {
         model2.add_layer::<F>(Layer::SchoolBookConvolution(Convolution::new(
             trad_conv3, bias3,
         )));
-        let trace2 = model.run::<F>(input.clone());
+        let trace2 = model.run_feedforward::<F>(input.clone());
 
         check_tensor_consistency_field::<GoldilocksExt2>(
             trace2.final_output().clone().to_fields(),
@@ -546,7 +546,7 @@ pub(crate) mod test {
         model.add_layer::<F>(Layer::Pooling(Pooling::Maxpool2D(Maxpool2D::default())));
 
         let input = Tensor::random(input_shape_padded.clone());
-        let _: crate::model::InferenceTrace<'_, _, GoldilocksExt2> = model.run::<F>(input.clone());
+        let _: crate::model::InferenceTrace<'_, _, GoldilocksExt2> = model.run_feedforward::<F>(input.clone());
     }
 
     #[test]
@@ -563,7 +563,7 @@ pub(crate) mod test {
         model.add_layer::<F>(Layer::Dense(dense1.clone()));
         model.add_layer::<F>(Layer::Dense(dense2.clone()));
 
-        let trace = model.run::<F>(input.clone());
+        let trace = model.run_feedforward::<F>(input.clone());
         // 4 steps because we requant after each dense layer
         assert_eq!(trace.steps.len(), 4);
 
@@ -588,7 +588,7 @@ pub(crate) mod test {
         model.add_layer::<F>(Layer::Dense(dense1));
         model.add_layer::<F>(Layer::Dense(dense2));
 
-        let trace = model.run::<F>(input.clone());
+        let trace = model.run_feedforward::<F>(input.clone());
 
         // Verify iterator yields correct input/output pairs
         let mut iter = trace.iter();
@@ -626,7 +626,7 @@ pub(crate) mod test {
         let mut model = Model::new();
         model.add_layer::<F>(Layer::Dense(dense1));
 
-        let trace = model.run::<F>(input.clone());
+        let trace = model.run_feedforward::<F>(input.clone());
 
         // Test reverse iteration
         let mut rev_iter = trace.iter().rev();
@@ -652,7 +652,7 @@ pub(crate) mod test {
         model.describe();
         println!("INPUT: {:?}", input);
         let bb = model.clone();
-        let trace = bb.run::<F>(input.clone()).to_field();
+        let trace = bb.run_feedforward::<F>(input.clone()).to_field();
         let dense_layers = model
             .layers()
             .flat_map(|(_id, l)| match l {
@@ -722,7 +722,7 @@ pub(crate) mod test {
         model.describe();
         let input = Tensor::new(vec![1024], random_vector_quant(1024));
         let trace: crate::model::InferenceTrace<'_, _, GoldilocksExt2> =
-            model.run::<F>(input.clone());
+            model.run_feedforward::<F>(input.clone());
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let ctx =
             Context::<GoldilocksExt2>::generate(&model, None).expect("Unable to generate context");
@@ -765,7 +765,7 @@ pub(crate) mod test {
         model.describe();
         let input = Tensor::new(vec![k_x, n_x, n_x], random_vector_quant(n_x * n_x * k_x));
         let trace: crate::model::InferenceTrace<'_, _, GoldilocksExt2> =
-            model.run::<F>(input.clone());
+            model.run_feedforward::<F>(input.clone());
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let ctx = Context::<GoldilocksExt2>::generate(&model, Some(input.get_shape()))
             .expect("Unable to generate context");
@@ -815,7 +815,7 @@ pub(crate) mod test {
                         let input =
                             Tensor::new(vec![k_x, n_x, n_x], random_vector_quant(n_x * n_x * k_x));
                         let trace: crate::model::InferenceTrace<'_, _, GoldilocksExt2> =
-                            model.run::<F>(input.clone());
+                            model.run_feedforward::<F>(input.clone());
                         let mut tr: BasicTranscript<GoldilocksExt2> =
                             BasicTranscript::new(b"m2vec");
                         let ctx =
@@ -835,3 +835,110 @@ pub(crate) mod test {
         }
     }
 }
+
+/*
+以下是对 model.rs 文件的整体结构和关键部分的总结：
+
+---
+
+### **1. 文件功能**
+该文件主要负责深度学习模型的定义、构建和推理（Inference），包括：
+- 定义模型的结构和层（Layer）。
+- 支持模型的构建、输入预处理和推理。
+- 提供推理过程的跟踪（Inference Trace）。
+- 支持随机模型生成和测试。
+
+---
+
+### **2. 关键部分**
+#### **核心结构**
+- **`Model`**
+  - 功能：表示深度学习模型，包含输入形状、层列表等信息。
+  - 主要字段：
+    - **`input_not_padded`**：未填充的输入形状。
+    - **`padded_in_shape`**：填充后的输入形状。
+    - **`layers`**：模型的层列表。
+  - 主要方法：
+    - **`new()`**：创建一个空模型。
+    - **`add_layer<F: ExtensionField>(&mut self, l: Layer)`**：向模型中添加一层，并根据需要添加量化层。
+    - **`set_input_shape(&mut self, not_padded: Vec<usize>)`**：设置输入形状，并计算填充后的形状。
+    - **`load_input_flat(&self, input: Vec<Element>) -> Tensor<Element>`**：加载并预处理输入张量。
+    - **`prepare_input(&self, input: Tensor<Element>) -> Tensor<Element>`**：根据第一层的类型对输入进行填充或调整。
+    - **`run<'a, E: ExtensionField>(&'a self, input: Tensor<Element>) -> InferenceTrace<'a, Element, E>`**：运行模型，返回推理跟踪。
+    - **`layers(&self)`**：返回模型层的迭代器。
+    - **`input_shape(&self)`**：返回模型的输入形状。
+    - **`first_output_shape(&self)`**：返回第一层的输出形状。
+    - **`describe(&self)`**：打印模型的描述信息。
+    - **`layer_count(&self)`**：返回模型的层数。
+
+- **`InferenceTrace<'a, E, F>`**
+  - 功能：记录模型推理过程中每一层的输入和输出。
+  - 主要字段：
+    - **`steps`**：推理步骤列表，每个步骤包含层、输出和卷积数据。
+    - **`input`**：模型的初始输入。
+  - 主要方法：
+    - **`new(input: Tensor<E>) -> Self`**：创建一个新的推理跟踪。
+    - **`last_step(&self) -> &InferenceStep<'a, E, F>`**：返回最后一步的推理信息。
+    - **`last_input(&self) -> &Tensor<E>`**：返回最后一步的输入。
+    - **`final_output(&self) -> &Tensor<E>`**：返回模型的最终输出。
+    - **`push_step(&mut self, step: InferenceStep<'a, E, F>)`**：添加一个推理步骤。
+    - **`iter(&self) -> InferenceTraceIterator<'_, 'a, E, F>`**：返回推理步骤的迭代器。
+
+- **`InferenceStep<'a, E, F>`**
+  - 功能：表示推理过程中的一步，包含层、输出和卷积数据。
+  - 主要字段：
+    - **`id`**：步骤索引。
+    - **`layer`**：当前步骤对应的层。
+    - **`output`**：当前步骤的输出。
+    - **`conv_data`**：卷积相关数据。
+
+- **`InferenceTraceIterator<'t, 'a, E, F>`**
+  - 功能：推理跟踪的迭代器，支持正向和反向迭代。
+  - 主要方法：
+    - **`next()`**：返回下一步的输入和推理步骤。
+    - **`next_back()`**：返回上一步的输入和推理步骤（反向迭代）。
+
+---
+
+#### **辅助功能**
+- **随机模型生成**
+  - **`Model::random(num_dense_layers: usize) -> (Self, Tensor<Element>)`**
+    - 功能：生成一个随机的模型和匹配的输入张量。
+    - 支持随机生成全连接层（Dense）和激活层（ReLU）。
+  - **`Model::random_pooling(num_layers: usize) -> (Model, Tensor<Element>)`**
+    - 功能：生成一个包含池化层（Maxpool2D）和全连接层的随机模型。
+
+- **一致性检查**
+  - **`check_tensor_consistency_field<E: ExtensionField>(real_tensor: Tensor<E>, padded_tensor: Tensor<E>)`**
+    - 功能：检查真实张量和填充张量的一致性。
+
+---
+
+### **3. 测试**
+文件包含多个单元测试，验证模型构建、推理和随机生成的核心功能：
+- **`test_model_long`**
+  - 功能：测试随机生成的模型的运行。
+- **`test_cnn`**
+  - 功能：测试卷积神经网络（CNN）的构建和推理。
+- **`test_conv_maxpool`**
+  - 功能：测试卷积层和池化层的组合。
+- **`test_model_manual_run`**
+  - 功能：手动运行模型并验证输出。
+- **`test_inference_trace_iterator`**
+  - 功能：测试推理跟踪的正向迭代器。
+- **`test_inference_trace_reverse_iterator`**
+  - 功能：测试推理跟踪的反向迭代器。
+- **`test_model_sequential`**
+  - 功能：测试模型的顺序推理和验证。
+- **`test_single_matvec_prover`**
+  - 功能：测试单个矩阵-向量乘法的证明生成和验证。
+- **`test_single_cnn_prover`**
+  - 功能：测试单个卷积层的证明生成和验证。
+- **`test_cnn_prover`**
+  - 功能：测试多个卷积层的证明生成和验证。
+
+---
+
+### **4. 总结**
+该文件的核心功能是定义深度学习模型的结构和推理过程，支持多种层类型（Dense、Convolution、Pooling 等）。它提供了模型的构建、输入预处理和推理跟踪功能，同时支持随机模型生成和一致性验证。通过单元测试验证了模型的核心逻辑和推理过程的正确性。
+*/

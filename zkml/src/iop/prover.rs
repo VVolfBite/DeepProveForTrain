@@ -493,3 +493,109 @@ where
         Ok(())
     }
 }
+
+
+/*
+以下是对 prover.rs 文件的整体结构和关键部分的总结：
+
+---
+
+### **1. 文件功能**
+该文件实现了零知识证明系统的证明者(Prover)核心逻辑，主要包括：
+- 神经网络推理过程的证明生成
+- FFT/IFFT批处理证明
+- 查找表证明的生成
+- 证明系统的状态管理
+
+---
+
+### **2. 关键部分**
+
+#### **核心数据结构**
+- **`Prover<'a, E, T>`**
+  - 功能：证明生成器
+  - 字段：
+    ```rust
+    pub struct Prover<'a, E: ExtensionField, T: Transcript<E>> {
+        ctx: &'a Context<E>,                    // 证明上下文
+        proofs: Vec<LayerProof<E>>,            // 层级证明
+        table_proofs: Vec<TableProof<E>>,      // 查找表证明
+        transcript: &'a mut T,                  // 转录器
+        commit_prover: precommit::CommitProver<E>,  // 承诺证明器
+        witness_ctx: Option<precommit::Context<E>>, // 见证上下文
+        witness_prover: precommit::CommitProver<E>, // 见证证明器
+        lookup_witness: Vec<LogUpInput<E>>,     // 查找见证
+        table_witness: Vec<LogUpInput<E>>,      // 表见证
+        challenge_storage: ChallengeStorage<E>,  // 挑战存储
+    }
+    ```
+
+#### **核心方法实现**
+
+##### **证明生成**
+- **`prove`**
+  - 功能：生成完整的推理证明
+  - 流程：
+    1. 写入承诺信息
+    2. 初始化见证上下文
+    3. 反向遍历层级生成证明
+    4. 生成表证明
+    5. 累积所有证明
+
+##### **FFT相关**
+- **`prove_batch_fft`** / **`prove_batch_ifft`**
+  - 功能：批量FFT/IFFT证明
+  - 实现：
+    1. 计算矩阵降维
+    2. 生成多项式承诺
+    3. 运行sumcheck协议
+
+##### **辅助功能**
+- **`phi_g_init`**
+  - 功能：初始化FFT/IFFT矩阵的omega值
+  - 特点：基于zkCNN论文实现
+
+---
+
+### **3. 优化特点**
+
+1. **性能优化**
+   ```rust
+   #[timed_instrument(level = "debug")]
+   fn prove_tables(&mut self) -> anyhow::Result<()> {
+       // 批量处理表证明
+   }
+   ```
+
+2. **内存管理**
+   ```rust
+   let mut step_infos = Vec::with_capacity(trace.last_step().id);
+   ```
+   - 预分配内存
+   - 避免频繁重分配
+
+3. **并行处理**
+   - 支持批量FFT/IFFT证明
+   - 并行化sumcheck计算
+
+---
+
+### **4. 安全性考虑**
+
+1. **类型安全**
+   - 泛型约束保证类型安全
+   - 生命周期标注确保引用安全
+
+2. **错误处理**
+   - 使用 Result 处理错误
+   - 详细的错误信息
+
+3. **状态验证**
+   - 证明过程的完整性验证
+   - 中间状态的一致性检查
+
+---
+
+### **5. 总结**
+prover.rs 实现了零知识证明系统的核心证明生成功能，支持神经网络的各层计算证明、FFT运算证明以及查找表证明。通过优化的实现和完善的错误处理，确保了证明生成的可靠性和效率。该实现对于构建可验证的神经网络推理系统具有重要作用。
+*/

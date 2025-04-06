@@ -946,6 +946,237 @@ where
 
         *self = Tensor::new(new_shape, new_data);
     }
+
+    /// 计算张量乘以标量的结果
+    pub fn scale(&self, scalar: T) -> Self {
+        Tensor {
+            data: self.data.par_iter().map(|x| *x * scalar).collect(),
+            shape: self.shape.clone(),
+            input_shape: self.input_shape.clone(),
+        }
+    }
+
+    /// 计算两个张量的外积
+    pub fn outer_product(&self, other: &Tensor<T>) -> Tensor<T> {
+        // 确保输入都是向量
+        assert!(
+            self.is_vector() && other.is_vector(),
+            "Both inputs must be vectors"
+        );
+
+        let m = self.shape[0];
+        let n = other.shape[0];
+        let mut result = Tensor::zeros(vec![m, n]);
+
+        // 并行计算外积
+        result
+            .data
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(idx, val)| {
+                let i = idx / n;
+                let j = idx % n;
+                *val = self.data[i] * other.data[j];
+            });
+
+        result
+    }
+
+    /// 将一个向量重塑为指定形状的张量
+    pub fn reshape(&self, new_shape: Vec<usize>) -> Self {
+        let new_size: usize = new_shape.iter().product();
+        assert_eq!(
+            self.data.len(),
+            new_size,
+            "New shape must have the same total size as the original tensor"
+        );
+
+        Tensor {
+            data: self.data.clone(),
+            shape: new_shape,
+            input_shape: self.input_shape.clone(),
+        }
+    }
+
+    /// 将卷积核旋转180度
+    pub fn rotate_180(&self) -> Self {
+        let shape = self.get_shape();
+        assert!(shape.len() >= 2, "Tensor must be at least 2D for rotation");
+
+        let h = shape[shape.len() - 2];
+        let w = shape[shape.len() - 1];
+        let batch_size: usize = shape[..shape.len() - 2].iter().product();
+
+        let mut rotated_data = Vec::with_capacity(self.data.len());
+
+        for b in 0..batch_size {
+            let start = b * h * w;
+            let end = (b + 1) * h * w;
+            let slice = &self.data[start..end];
+
+            // 旋转当前批次的数据
+            for i in (0..h).rev() {
+                for j in (0..w).rev() {
+                    rotated_data.push(slice[i * w + j]);
+                }
+            }
+        }
+
+        Self::new(shape.clone(), rotated_data)
+    }
+
+    /// 在空间维度上求和，用于计算偏置梯度
+    pub fn sum_spatial(&self) -> Self {
+        let shape = self.get_shape();
+        assert!(
+            shape.len() >= 3,
+            "Tensor must be at least 3D for spatial summation"
+        );
+
+        let channels = shape[0];
+        let h = shape[shape.len() - 2];
+        let w = shape[shape.len() - 1];
+
+        let mut sums = vec![T::default(); channels];
+
+        // 对每个通道的所有空间位置求和
+        for c in 0..channels {
+            let mut channel_sum = T::default();
+            for i in 0..h {
+                for j in 0..w {
+                    let idx = c * h * w + i * w + j;
+                    channel_sum = channel_sum + self.data[idx];
+                }
+            }
+            sums[c] = channel_sum;
+        }
+
+        Self::new(vec![channels], sums)
+    }
+
+    /// 完整卷积操作，用于计算输入梯度
+    pub fn conv_full(&self, other: &Tensor<T>) -> Self
+    where
+        T: Copy + Clone + Send + Sync + std::iter::Sum,
+        T: std::ops::Add<Output = T> + std::ops::Mul<Output = T> + std::default::Default,
+    {
+        let shape = self.get_shape();
+        let other_shape = other.get_shape();
+
+        // 计算完整卷积后的输出大小
+        let h_out = shape[shape.len() - 2] + other_shape[other_shape.len() - 2] - 1;
+        let w_out = shape[shape.len() - 1] + other_shape[other_shape.len() - 1] - 1;
+
+        // 输出形状为 [batch_size, channels, h_out, w_out]
+        let mut output_shape = shape.clone();
+        let len = output_shape.len();
+        output_shape[len - 2] = h_out;
+        output_shape[len - 1] = w_out;
+
+        let mut output = vec![T::default(); output_shape.iter().product()];
+
+        // 获取卷积核和输入的维度
+        let kernel_h = shape[shape.len() - 2];
+        let kernel_w = shape[shape.len() - 1];
+        let input_h = other_shape[other_shape.len() - 2];
+        let input_w = other_shape[other_shape.len() - 1];
+
+        // 计算batch和channel的数量
+        let batch_size: usize = other_shape[..other_shape.len() - 2].iter().product();
+        let channels: usize = shape[..shape.len() - 2].iter().product();
+
+        // 并行计算完整卷积
+        output
+            .par_chunks_mut(h_out * w_out)
+            .enumerate()
+            .for_each(|(idx, out_slice)| {
+                let b = idx / channels;
+                let c = idx % channels;
+
+                // 对每个输出位置进行卷积计算
+                for i in 0..h_out {
+                    for j in 0..w_out {
+                        let mut sum = T::default();
+
+                        // 对卷积核的每个元素进行计算
+                        for ki in 0..kernel_h {
+                            for kj in 0..kernel_w {
+                                let h = i as i32 - ki as i32;
+                                let w = j as i32 - kj as i32;
+
+                                if h >= 0 && h < input_h as i32 && w >= 0 && w < input_w as i32 {
+                                    let input_idx =
+                                        b * input_h * input_w + h as usize * input_w + w as usize;
+                                    let kernel_idx = c * kernel_h * kernel_w + ki * kernel_w + kj;
+
+                                    sum = sum + self.data[kernel_idx] * other.data[input_idx];
+                                }
+                            }
+                        }
+
+                        out_slice[i * w_out + j] = sum;
+                    }
+                }
+            });
+
+        Self::new(output_shape, output)
+    }
+
+    /// 互相关运算，用于计算权重梯度
+    pub fn correlate(&self, grad: &Tensor<T>) -> Self
+    where
+        T: Copy + Clone + Send + Sync + std::iter::Sum,
+        T: std::ops::Add<Output = T> + std::ops::Mul<Output = T> + std::default::Default,
+    {
+        let input_shape = self.get_shape();
+        let grad_shape = grad.get_shape();
+
+        // 输出形状应该与卷积核形状相同
+        // [out_channels, in_channels, kernel_h, kernel_w]
+        let out_channels = grad_shape[0];
+        let in_channels = input_shape[0];
+        let kernel_h = input_shape[1] - grad_shape[1] + 1;
+        let kernel_w = input_shape[2] - grad_shape[2] + 1;
+
+        let output_shape = vec![out_channels, in_channels, kernel_h, kernel_w];
+        let mut output = vec![T::default(); output_shape.iter().product()];
+
+        // 并行计算互相关
+        output
+            .par_chunks_mut(kernel_h * kernel_w)
+            .enumerate()
+            .for_each(|(idx, out_slice)| {
+                let oc = idx / in_channels;
+                let ic = idx % in_channels;
+
+                // 对每个卷积核位置进行计算
+                for kh in 0..kernel_h {
+                    for kw in 0..kernel_w {
+                        let mut sum = T::default();
+
+                        // 对输入和梯度的每个对应位置进行计算
+                        for i in 0..grad_shape[1] {
+                            for j in 0..grad_shape[2] {
+                                let input_h = i + kh;
+                                let input_w = j + kw;
+
+                                let input_idx = ic * input_shape[1] * input_shape[2]
+                                    + input_h * input_shape[2]
+                                    + input_w;
+                                let grad_idx =
+                                    oc * grad_shape[1] * grad_shape[2] + i * grad_shape[2] + j;
+
+                                sum = sum + self.data[input_idx] * grad.data[grad_idx];
+                            }
+                        }
+
+                        out_slice[kh * kernel_w + kw] = sum;
+                    }
+                }
+            });
+
+        Self::new(output_shape, output)
+    }
 }
 
 impl<T> Tensor<T>
@@ -1651,5 +1882,158 @@ mod test {
             pad_result.get_data()[..orows],
             "Unable to get rid of garbage values from conv fft."
         );
+    }
+
+    #[test]
+    fn test_tensor_scale() {
+        let tensor = Tensor::new(vec![2, 2], vec![1, 2, 3, 4]);
+        let scaled = tensor.scale(2);
+        assert_eq!(scaled.data, vec![2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn test_outer_product() {
+        let v1 = Tensor::new(vec![2], vec![1, 2]);
+        let v2 = Tensor::new(vec![3], vec![3, 4, 5]);
+        let result = v1.outer_product(&v2);
+        assert_eq!(result.shape, vec![2, 3]);
+        assert_eq!(result.data, vec![3, 4, 5, 6, 8, 10]);
+    }
+
+    #[test]
+    fn test_reshape() {
+        let tensor = Tensor::new(vec![2, 2], vec![1, 2, 3, 4]);
+        let reshaped = tensor.reshape(vec![4]);
+        assert_eq!(reshaped.shape, vec![4]);
+        assert_eq!(reshaped.data, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_rotate_180() {
+        // 测试单通道
+        let tensor = Tensor::new(
+            vec![2, 2], // [height, width]
+            vec![1, 2, 3, 4],
+        );
+        let rotated = tensor.rotate_180();
+        assert_eq!(
+            rotated.get_data(),
+            vec![4, 3, 2, 1],
+            "Single channel rotation failed"
+        );
+
+        // 测试多通道
+        let tensor_multi = Tensor::new(
+            vec![2, 2, 2], // [channels, height, width]
+            vec![
+                1, 2, // channel 1
+                3, 4, 5, 6, // channel 2
+                7, 8,
+            ],
+        );
+        let rotated_multi = tensor_multi.rotate_180();
+        assert_eq!(
+            rotated_multi.get_data(),
+            vec![4, 3, 2, 1, 8, 7, 6, 5],
+            "Multi-channel rotation failed"
+        );
+    }
+
+    #[test]
+    fn test_sum_spatial() {
+        // 测试基本情况
+        let tensor = Tensor::new(
+            vec![2, 2, 2], // [channels, height, width]
+            vec![
+                1, 2, // channel 1
+                3, 4, 5, 6, // channel 2
+                7, 8,
+            ],
+        );
+        let summed = tensor.sum_spatial();
+        assert_eq!(summed.get_shape(), vec![2]); // [channels]
+        assert_eq!(summed.get_data(), vec![10, 26]); // channel 1: 1+2+3+4=10, channel 2: 5+6+7+8=26
+
+        // 测试更大的空间维度
+        let tensor_large = Tensor::new(
+            vec![2, 3, 3], // [channels, height, width]
+            vec![
+                1, 2, 3, // channel 1
+                4, 5, 6, 7, 8, 9, 9, 8, 7, // channel 2
+                6, 5, 4, 3, 2, 1,
+            ],
+        );
+        let summed_large = tensor_large.sum_spatial();
+        assert_eq!(summed_large.get_shape(), vec![2]);
+        assert_eq!(summed_large.get_data(), vec![45, 45]); // channel 1: sum(1..9)=45, channel 2: sum(9,8,7..1)=45
+    }
+    #[test]
+    fn test_conv_full() {
+        // 测试基本卷积
+        let kernel = Tensor::new(
+            vec![1, 2, 2], // [channels, height, width]
+            vec![1, 2, 3, 4],
+        );
+        let input = Tensor::new(
+            vec![1, 2, 2], // [channels, height, width]
+            vec![1, 1, 1, 1],
+        );
+    
+        // 完整卷积的输出大小应该是: (2+2-1)x(2+2-1) = 3x3
+        // 计算过程:
+        // [1 2] * [1 1] = [1 3 2]
+        // [3 4]   [1 1]   [4 10 6]
+        //                  [3 7 4]
+        let result = kernel.conv_full(&input);
+        let expected = Tensor::new(
+            vec![1, 3, 3], 
+            vec![1, 3, 2,   // 第一行
+                 4, 10, 6,  // 第二行
+                 3, 7, 4]   // 第三行
+        );
+        assert_eq!(result, expected, "Basic convolution failed");
+    }
+    #[test]
+    fn test_correlate() {
+        // 创建输入
+        let input = Tensor::new(
+            vec![2, 3, 3], // [channels, height, width]
+            vec![
+                1, 2, 3,   // channel 1
+                4, 5, 6,
+                7, 8, 9,
+                
+                9, 8, 7,   // channel 2
+                6, 5, 4,
+                3, 2, 1
+            ]
+        );
+    
+        // 创建输出梯度
+        let output_grad = Tensor::new(
+            vec![1, 2, 2], // [out_channels, height, width]
+            vec![1, 1, 
+                 1, 1]
+        );
+    
+        // 互相关计算权重梯度
+        // Channel 1:
+        // [1 2 3] * [1 1] = [12 16]  // (1*1 + 2*1 + 4*1 + 5*1 = 12)
+        // [4 5 6]   [1 1]   [24 28]  // (4*1 + 5*1 + 7*1 + 8*1 = 24)
+        // [7 8 9]
+        //
+        // Channel 2:
+        // [9 8 7] * [1 1] = [28 24]  // (9*1 + 8*1 + 6*1 + 5*1 = 28)
+        // [6 5 4]   [1 1]   [16 12]  // (6*1 + 5*1 + 3*1 + 2*1 = 16)
+        // [3 2 1]
+        let weight_grad = input.correlate(&output_grad);
+        
+        let expected = Tensor::new(
+            vec![1, 2, 2, 2],  // [out_channels, in_channels, kernel_height, kernel_width]
+            vec![12, 16, 24, 28,   // channel 1
+                 28, 24, 16, 12]   // channel 2
+        );
+        
+        assert_eq!(weight_grad, expected, "Correlation computation failed");
     }
 }

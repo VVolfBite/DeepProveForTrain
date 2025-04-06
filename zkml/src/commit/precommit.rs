@@ -556,3 +556,127 @@ mod test {
         assert_eq!(beta_mle.evaluate(&r2), F::ZERO);
     }
 }
+
+/*
+好的，让我为您分析 precommit.rs 文件：
+
+/*
+以下是对 precommit.rs 文件的整体结构和关键部分的总结：
+
+---
+
+### **1. 文件功能**
+该文件实现了多项式承诺方案的核心功能，主要包括：
+- 多个独立多项式的承诺生成和验证
+- 基于 Sumcheck 的批量证明生成
+- 声明(Claim)的验证和管理
+- 承诺上下文(Context)的管理
+
+---
+
+### **2. 关键部分**
+
+#### **核心数据结构**
+
+- **`Context<E>`**
+  - 功能：承诺系统的上下文环境
+  - 字段：
+    ```rust
+    pub struct Context<E: ExtensionField> {
+        // 证明者部分
+        pp: ProverParam,
+        commitment: CommitmentWithWitness,
+        polys: DenseMultilinearExtension<E>,
+        
+        // 共享部分
+        poly_aux: VPAuxInfo<E>,
+        poly_info: HashMap<PolyID, (usize, usize)>,
+        
+        // 验证者部分
+        vp: VerifierParam,
+        vcommitment: Commitment
+    }
+    ```
+
+- **`CommitProver<E>`**
+  - 功能：多项式承诺的证明者
+  - 方法：
+    - `add_claim()`: 添加待证明的声明
+    - `prove()`: 生成批量证明
+
+- **`CommitVerifier<E>`**
+  - 功能：承诺证明的验证者
+  - 方法：
+    - `add_claim()`: 添加待验证的声明
+    - `verify()`: 验证批量证明
+
+#### **核心流程**
+
+1. **承诺生成**
+   ```rust
+   pub fn generate(polys: Vec<(PolyID, Vec<E>)>) -> Result<Self>
+   ```
+   - 对多项式进行排序和填充
+   - 生成承诺参数
+   - 创建多线性扩展
+
+2. **证明生成**
+   ```rust
+   pub fn prove<T: Transcript<E>>(
+       self,
+       ctx: &Context<E>,
+       t: &mut T,
+   ) -> Result<CommitProof<E>>
+   ```
+   - 声明排序和验证
+   - Sumcheck 证明生成
+   - PCS 开启证明生成
+
+3. **证明验证**
+   ```rust
+   pub fn verify<T: Transcript<E>>(
+       self,
+       ctx: &Context<E>,
+       proof: CommitProof<E>,
+       t: &mut T,
+   ) -> Result<()>
+   ```
+   - Sumcheck 证明验证
+   - PCS 开启证明验证
+   - Beta 矩阵评估验证
+
+---
+
+### **3. 辅助功能**
+
+- **`beta_matrix_mle`**
+  - 功能：计算 Beta 矩阵的多线性扩展
+  - 实现：基于挑战值和评估点
+
+- **`sort_claims`**
+  - 功能：按多项式大小排序声明
+  - 验证：确保声明和多项式匹配
+
+---
+
+### **4. 测试用例**
+
+- **`test_commit_matrix`**
+  - 功能：测试矩阵承诺系统
+  - 验证：生成和验证随机矩阵的证明
+
+- **`test_commit_batch`**
+  - 功能：测试批量承诺系统
+  - 验证：多个多项式的批量证明
+
+- **`test_beta_compute`**
+  - 功能：测试 Beta 计算
+  - 验证：Beta 矩阵的正确性
+
+---
+
+### **5. 总结**
+precommit.rs 实现了一个高效的多项式批量承诺系统，通过 Sumcheck 和 PCS 相结合的方式支持多个独立多项式的证明生成和验证。该实现考虑了性能优化（批处理）和安全性（完整性验证），为零知识证明系统提供了关键的承诺功能。
+
+*/
+ */
