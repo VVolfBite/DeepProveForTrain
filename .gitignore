@@ -1,5 +1,4 @@
 target
-.vscode
 *.log
 log.txt
 logs/
@@ -10,6 +9,3 @@ table_cache_dev_*
 .env
 proptest-regressions/
 *.json
-zkml/bench
-zkml/data
-zkml/cifar_net.pth
