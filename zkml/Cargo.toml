@@ -1,0 +1,42 @@
+[package]
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+name = "zkml"
+readme.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ark-std.workspace = true
+clap = { version = "4", features = ["derive"] }
+code-timing-macros = { version = "0.0.6", features = ["tracing"] }
+csv = "1.3.1"
+derive_more = { version = "2.0.1", features = ["full"] }
+env_logger = { version = "0.11.6" }
+ff.workspace = true
+ff_ext = { version = "0.1.0", path = "../ff_ext" }
+gkr = { version = "0.1.0", path = "../gkr" }
+goldilocks.workspace = true
+itertools.workspace = true
+mpcs = { version = "0.1.0", path = "../mpcs" }
+multilinear_extensions = { version = "0.1.0", path = "../multilinear_extensions", features = [
+    "parallel",
+] }
+num-traits = "0.2.19"
+once_cell = "1.20.3"
+poseidon = { version = "0.1.0", path = "../poseidon" }
+rayon.workspace = true
+rmp-serde = "1.3.0"
+serde.workspace = true
+serde_json.workspace = true
+simple-frontend = { path = "../simple-frontend" }
+sumcheck = { version = "0.1.0", path = "../sumcheck" }
+timed = { workspace = true }
+timed-core = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+tract-onnx = "0.21.9"
+transcript = { version = "0.1.0", path = "../transcript" }
