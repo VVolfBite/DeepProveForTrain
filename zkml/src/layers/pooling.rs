@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use sumcheck::structs::IOPProverState;
 
 use super::LayerCtx;
+use std::sync::Arc;
 
 pub const MAXPOOL2D_KERNEL_SIZE: usize = 2;
 
@@ -63,6 +64,30 @@ where
     pub(crate) zerocheck_evals: Vec<E>,
     /// This tells the verifier how far apart the variables get fixed on the input MLE
     pub(crate) variable_gap: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PoolingBackwardCtx<E> {
+    pub input_poly_id: PolyID,
+    pub matrix_poly_aux: VPAuxInfo<E>,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct PoolingBackwardProof<E: ExtensionField> 
+where
+    E::BaseField: Serialize + DeserializeOwned,
+{
+    pub sumcheck: IOPProof<E>,
+    pub individual_claims: Vec<E>,
+}
+
+impl<E: ExtensionField> PoolingBackwardProof<E> 
+where
+    E::BaseField: Serialize + DeserializeOwned,
+{
+    pub fn individual_to_virtual_claim(&self) -> E {
+        self.individual_claims.iter().fold(E::ONE, |acc, e| acc * e)
+    }
 }
 
 impl Pooling {
@@ -278,6 +303,92 @@ impl Pooling {
             variable_gap: padded_input_row_length_log - 1,
         }));
         Ok(next_claim)
+    }
+
+    pub fn prove_backward_step<E: ExtensionField, T: Transcript<E>>(
+        &self,
+        prover: &mut Prover<E, T>,
+        last_claim: Claim<E>,
+        output_grad: &Tensor<Element>,
+        input: &Tensor<Element>,
+        info: &PoolingBackwardCtx<E>,
+    ) -> anyhow::Result<Claim<E>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+    {
+        println!("\n=== 转换为MLE前的原始值 ===");
+        println!("输出梯度原始值:");
+        println!("{:?}", output_grad.get_data());
+        
+        println!("\n原始输入值:");
+        println!("{:?}", input.get_data());
+        
+        println!("\n期望梯度原始值:");
+        let input_grad = match self {
+            Pooling::Maxpool2D(maxpool) => maxpool.backward(output_grad, input, None)
+        };
+        println!("{:?}", input_grad.get_data());
+        
+        // 构建虚拟多项式
+        println!("\n=== 构建虚拟多项式 ===");
+        let num_vars = input.get_shape().iter().map(|&x| x.ilog2() as usize).sum();
+        println!("变量数量: {}", num_vars);
+        
+        // 将输出梯度转换为MLE
+        let grad_mle = Arc::new(output_grad.evals_flat::<E>().into_mle());
+        println!("输出梯度MLE构建完成");
+        
+        // 将输入转换为MLE
+        let input_mle = Arc::new(input.evals_flat::<E>().into_mle());
+        println!("输入MLE构建完成");
+        
+        // 将期望梯度转换为MLE
+        let expected_grad_mle = Arc::new(input_grad.evals_flat::<E>().into_mle());
+        println!("期望梯度MLE构建完成");
+        
+        // 构建虚拟多项式
+        let mut vp = VirtualPolynomial::<E>::new(num_vars);
+        vp.add_mle_list(vec![grad_mle.clone(), input_mle.clone()], E::ONE);
+        vp.add_mle_list(vec![expected_grad_mle.clone()], -E::ONE);
+        println!("虚拟多项式构建完成");
+        
+        // 生成sumcheck证明
+        println!("\n=== 生成Sumcheck证明 ===");
+        let (proof, state) = IOPProverState::prove_parallel(vp, prover.transcript);
+        println!("Sumcheck证明生成完成");
+        
+        // 获取个别多项式的评估值
+        let individual_claims = state.get_mle_final_evaluations();
+        println!("\n=== 个别多项式评估值 ===");
+        println!("grad_out: {:?}", individual_claims[0]);
+        println!("input: {:?}", individual_claims[1]);
+        println!("expected_grad: {:?}", individual_claims[2]);
+        
+        // 验证约束关系
+        let computed_grad = individual_claims[0] * individual_claims[1];
+        println!("\n=== 约束验证 ===");
+        println!("计算得到的梯度: {:?}", computed_grad);
+        println!("期望的梯度: {:?}", individual_claims[2]);
+        
+        ensure!(
+            computed_grad == individual_claims[2],
+            "反向传播计算不匹配: grad_out {:?} * input {:?} != expected_grad {:?}",
+            individual_claims[0],
+            individual_claims[1],
+            individual_claims[2]
+        );
+
+        // 添加证明
+        prover.push_proof(LayerProof::PoolingBackward(PoolingBackwardProof {
+            sumcheck: proof.clone(),
+            individual_claims: individual_claims.clone(),
+        }));
+
+        Ok(Claim {
+            point: proof.point,
+            eval: computed_grad,
+        })
     }
 }
 

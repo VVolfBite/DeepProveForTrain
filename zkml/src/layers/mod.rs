@@ -28,7 +28,7 @@ use activation::ActivationCtx;
 use convolution::{ConvCtx, ConvProof, SchoolBookConvCtx};
 use dense::{DenseCtx, DenseProof, DenseBackwardProof};
 use ff_ext::ExtensionField;
-use pooling::{PoolingCtx, PoolingProof};
+use pooling::{PoolingCtx, PoolingProof, PoolingBackwardProof};
 use requant::RequantCtx;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 #[derive(Clone, Debug)]
@@ -78,6 +78,7 @@ where
     ActivationBackward(ActivationBackwardProof<E>),
     Requant(RequantProof<E>),
     Pooling(PoolingProof<E>),
+    PoolingBackward(PoolingBackwardProof<E>),
 }
 pub enum LayerOutput<F>
 where
@@ -214,6 +215,7 @@ where
             Self::ActivationBackward(_) => "ActivationBackward".to_string(),
             Self::Requant(_) => "Requant".to_string(),
             Self::Pooling(_) => "Pooling".to_string(),
+            Self::PoolingBackward(_) => "PoolingBackward".to_string(),
         }
     }
 
@@ -223,6 +225,7 @@ where
             LayerProof::DenseBackward(..) => None,
             LayerProof::Convolution(..) => None,
             LayerProof::ActivationBackward(..) => None,
+            LayerProof::PoolingBackward(..) => None,
             LayerProof::Activation(ActivationProof { lookup, .. })
             | LayerProof::Requant(RequantProof { lookup, .. })
             | LayerProof::Pooling(PoolingProof { lookup, .. }) => Some(lookup.fractional_outputs()),

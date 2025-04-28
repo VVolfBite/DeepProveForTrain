@@ -1,21 +1,22 @@
 use crate::{
     Claim, Prover,
     commit::same_poly,
-    iop::{context::ContextAux, verifier::Verifier},
-    layers::{LayerCtx, LayerProof, PolyID},
+    iop::{context::{Context, ContextAux}, verifier::{Verifier, IO, verify}},
+    layers::{LayerCtx, LayerProof, PolyID, Layer, Dense},
     lookup::{
         context::TableType,
         logup_gkr::{
             prover::batch_prove as logup_batch_prove, 
-            structs::LogUpProof,
+            structs::{LogUpProof, LogUpInput},
             verifier::verify_logup_proof,
         },
     },
+    model::{Model, InferenceTrace, InferenceStep},
+    quantization::{TensorFielder, IntoElement},
 };
 use multilinear_extensions::virtual_poly::{VirtualPolynomial, VPAuxInfo};  // 添加 VPAuxInfo
 use multilinear_extensions::mle::{IntoMLE, MultilinearExtension, DenseMultilinearExtension}; // 修改导入，添加 MultilinearExtension trait
 use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};  // 添加 IOPVerifierState
-use sumcheck::prover::batch_prove;  // 添加这个导入
 use ff_ext::ExtensionField;
 use gkr::util::ceil_log2;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -23,6 +24,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use transcript::Transcript;
 use anyhow::{ensure, Result};
 use std::sync::Arc;
+use std::marker::PhantomData;
+use ff::Field;
+use std::collections::BTreeSet;
+use goldilocks::{GoldilocksExt2, Goldilocks, SmallField};  // 添加 SmallField
+use itertools::Itertools;
+use transcript::BasicTranscript;
 
 use crate::{
     Element,
@@ -144,6 +151,168 @@ impl Activation {
         }));
         Ok(input_claim)
     }
+
+    pub(crate) fn prove_backward_step<E: ExtensionField, T: Transcript<E>>(
+        &self,
+        prover: &mut Prover<E, T>,
+        last_claim: Claim<E>,    
+        output_grad: &Tensor<Element>,  
+        input: &Tensor<Element>,        
+        info: &ActivationBackwardCtx<E>,  
+    ) -> Result<Claim<E>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,  
+        E::BaseField: Serialize + DeserializeOwned,
+        T: Transcript<E>,  
+    {
+        println!("\n=== 转换为MLE前的原始值 ===");
+        println!("输出梯度原始值:");
+        for (i, &val) in output_grad.get_data().iter().enumerate() {
+            println!("位置 {}: {}", i, val);
+        }
+        
+        println!("\nReLU导数原始值:");
+        let relu_deriv_field: Vec<E::BaseField> = input.get_data()
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let deriv = if x > *ZERO { 1 } else { 0 };
+                println!("位置 {}: 输入 = {}, 导数 = {}", i, x, deriv);
+                E::BaseField::from(deriv as u64)
+            })
+            .collect();
+            
+        println!("\n期望梯度原始值:");
+        let expected_grad = match self {
+            Activation::Relu(relu) => relu.backward(output_grad, input)
+        };
+        for (i, &val) in expected_grad.get_data().iter().enumerate() {
+            println!("位置 {}: {}", i, val);
+        }
+        
+        println!("\n=== 约束验证 ===");
+        for i in 0..output_grad.get_data().len() {
+            let grad_out = output_grad.get_data()[i];
+            let relu_deriv = if input.get_data()[i] > *ZERO { 1 } else { 0 };
+            let expected = expected_grad.get_data()[i];
+            println!("位置 {}: {} * {} = {} (期望 {})", 
+                i, grad_out, relu_deriv, grad_out * relu_deriv, expected);
+        }
+        
+        // 构建lookup表
+        println!("\n=== 构建Lookup表 ===");
+        let (inputs_base, derivs_base): (Vec<E::BaseField>, Vec<E::BaseField>) = 
+            (*quantization::MIN..=*quantization::MAX)
+                .map(|x| {
+                    let val: E = Element::from(x).to_field();
+                    let deriv: E = Element::from(if x > 0 { 1i128 } else { 0i128 }).to_field();
+                    println!("Lookup表项 - 输入: {}, 值: {:?}, 导数: {:?}", x, val, deriv);
+                    (val.as_bases()[0], deriv.as_bases()[0])
+                })
+                .unzip();
+        
+        println!("\n=== 构建LogUpInput ===");
+        println!("实际输入转换为域元素:");
+        let actual_inputs: Vec<E::BaseField> = input.evals_flat::<E>()
+            .iter()
+            .map(|x| {
+                println!("输入域元素: {:?}", x);
+                x.as_bases()[0]
+            })
+            .collect();
+        
+        // 获取lookup证明
+        let prover_info = LogUpInput::new_lookup(
+            vec![
+                inputs_base.clone(),  // 输入值表
+                derivs_base.clone(),  // 导数值表
+                actual_inputs,  // 实际输入
+            ],
+            E::ONE,  // constant_challenge
+            E::ONE,  // column_separation_challenge
+            1  // columns_per_instance
+        )?;
+        
+        println!("\n=== 生成Lookup证明 ===");
+        let logup_proof = logup_batch_prove(&prover_info, prover.transcript)?;
+        println!("Lookup证明输出声明数量: {}", logup_proof.output_claims().len());
+        for (i, claim) in logup_proof.output_claims().iter().enumerate() {
+            println!("声明 {}: 点={:?}, 评估值={:?}", i, claim.point, claim.eval);
+        }
+        
+        // 构建虚拟多项式
+        println!("\n=== 构建虚拟多项式 ===");
+        let num_vars = Relu::num_vars();
+        println!("变量数量: {}", num_vars);
+        
+        let grad_mle = Arc::new(output_grad.evals_flat::<E>().into_mle());
+        println!("梯度MLE构建完成");
+        
+        let relu_deriv_mle = Arc::new(DenseMultilinearExtension::from_evaluations_vec(
+            num_vars,
+            relu_deriv_field.clone()
+        ));
+        println!("ReLU导数MLE构建完成");
+        
+        let expected_grad_mle = Arc::new(expected_grad.evals_flat::<E>().into_mle());
+        println!("期望梯度MLE构建完成");
+        
+        let mut vp = VirtualPolynomial::<E>::new(num_vars);
+        vp.add_mle_list(vec![grad_mle.clone(), relu_deriv_mle.clone()], E::ONE);
+        vp.add_mle_list(vec![expected_grad_mle.clone()], -E::ONE);
+        println!("虚拟多项式构建完成");
+        
+        // 生成sumcheck证明
+        println!("\n=== 生成Sumcheck证明 ===");
+        let (proof, state) = IOPProverState::prove_parallel(vp, prover.transcript);
+        println!("Sumcheck证明生成完成");
+        
+        // 获取个别多项式的评估值
+        let individual_claims = state.get_mle_final_evaluations();
+        println!("\n=== 个别多项式评估值 ===");
+        println!("grad_out: {:?}", individual_claims[0]);
+        println!("relu_deriv: {:?}", individual_claims[1]);
+        println!("expected_grad: {:?}", individual_claims[2]);
+        
+        // 验证约束关系
+        let computed_grad = individual_claims[0] * individual_claims[1];
+        println!("\n=== 约束验证 ===");
+        println!("计算得到的梯度: {:?}", computed_grad);
+        println!("期望的梯度: {:?}", individual_claims[2]);
+        
+        ensure!(
+            computed_grad == individual_claims[2],
+            "反向传播计算不匹配: grad_out {:?} * relu_deriv {:?} != expected_grad {:?}",
+            individual_claims[0],
+            individual_claims[1],
+            individual_claims[2]
+        );
+
+        // 构建same_poly证明
+        println!("\n=== 构建Same Poly证明 ===");
+        let mut same_poly_prover = same_poly::Prover::<E>::new(expected_grad.evals_flat::<E>().into_mle());
+        let same_poly_ctx = same_poly::Context::<E>::new(last_claim.point.len());
+        same_poly_prover.add_claim(last_claim.clone())?;
+        println!("添加last_claim完成");
+        
+        // 添加lookup证明的输出声明
+        let output_claim = logup_proof.output_claims()[1].clone();
+        same_poly_prover.add_claim(output_claim)?;
+        println!("添加output_claim完成");
+        
+        let claim_acc_proof = same_poly_prover.prove(&same_poly_ctx, prover.transcript)?;
+        println!("Same Poly证明生成完成");
+
+        prover.push_proof(LayerProof::ActivationBackward(ActivationBackwardProof {
+            sumcheck: proof.clone(),
+            individual_claims: individual_claims.clone(),
+        }));
+
+        Ok(Claim {
+            point: proof.point,
+            eval: computed_grad,
+        })
+    }
 }
 
 impl ActivationCtx {
@@ -245,64 +414,26 @@ impl Relu {
         // 计算ReLU的导数
         let derivative = input.get_data()
             .iter()
-            .map(|&x| (x > *ZERO) as Element)  // 使用更简洁的写法
+            .map(|&x| {
+                let deriv = (x > *ZERO) as Element;
+                deriv
+            })
             .collect::<Vec<_>>();
-
+        
         // 计算输入梯度: dL/dx = dL/dy * relu'(x)
+        let grad_in = output_grad.get_data()
+            .iter()
+            .zip(derivative.iter())
+            .map(|(&grad, &deriv)| {
+                let result = grad * deriv;
+                result
+            })
+            .collect::<Vec<_>>();
+            
         Tensor::new(
             input.get_shape().clone(),
-            output_grad.get_data()
-                .iter()
-                .zip(derivative.iter())
-                .map(|(&grad, &deriv)| grad * deriv)
-                .collect()
+            grad_in
         )
-    }
-
-    pub fn prove_backward_step<'b, E, T>(
-        &self,
-        prover: &mut Prover<E, T>,
-        last_claim: Claim<E>,
-        output_grad: &Tensor<Element>,
-        input: &Tensor<Element>,
-        info: &ActivationBackwardCtx<E>,
-    ) -> Result<Claim<E>>
-    where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
-        T: Transcript<E>,
-    {
-        // 计算输入梯度并转换为 Arc<dyn MultilinearExtension>
-        let input_mle = Arc::new(input.evals_flat::<E>().into_mle());
-        let grad_mle = Arc::new(output_grad.evals_flat::<E>().into_mle());
-        
-        // 构造虚拟多项式
-        let num_vars = input_mle.num_vars();
-        let mut vp = VirtualPolynomial::<E>::new(num_vars);
-        
-        // fix_variables 返回的也需要包装成 Arc
-        let fixed_input_mle = Arc::new(input_mle.fix_variables(&last_claim.point));
-        
-        vp.add_mle_list(
-            vec![fixed_input_mle, grad_mle],
-            E::ONE,
-        );
-
-        // 使用 batch_prove 而不是 prove_parallel
-        let (proof, individual_claims) = batch_prove(
-            vp,
-            prover.transcript,
-        )?;  // 注意这里需要用 ? 操作符处理错误
-
-        prover.push_proof(LayerProof::ActivationBackward(ActivationBackwardProof {
-            sumcheck: proof.clone(),
-            individual_claims,
-        }));
-
-        Ok(Claim {
-            point: proof.point,
-            eval: individual_claims[1],
-        })
     }
 
     pub fn verify_backward_step<E: ExtensionField, T: Transcript<E>>(
@@ -318,48 +449,177 @@ impl Relu {
         E::BaseField: Serialize + DeserializeOwned,
         E: Serialize + DeserializeOwned,
     {
-        // 重构虚拟多项式
-        let input_mle = input.evals_flat::<E>().into_mle();
-        let grad_mle = output_grad.evals_flat::<E>().into_mle();
+        // 第一步：构建ReLU导数的查找表
+        let (inputs_base, derivs_base): (Vec<E::BaseField>, Vec<E::BaseField>) = 
+            (*quantization::MIN..=*quantization::MAX)
+                .map(|x| {
+                    let val: E = Element::from(x).to_field();
+                    let deriv: E = Element::from(if x > 0 { 1i128 } else { 0i128 }).to_field();
+                    (val.as_bases()[0], deriv.as_bases()[0])
+                })
+                .unzip();
+
+        // 在使用前克隆derivs_base
+        let derivs_base_clone = derivs_base.clone();
+
+        // 第二步：验证lookup证明
+        let lookup_input = LogUpInput::new_lookup(
+            vec![
+                inputs_base,  // 输入值表
+                derivs_base,  // 导数值表
+                input.evals_flat::<E>().iter().map(|x| x.as_bases()[0]).collect(),  // 实际输入
+            ],
+            E::ONE,  // constant_challenge
+            E::ONE,  // column_separation_challenge
+            1  // columns_per_instance
+        )?;
+
+        // 第三步：重构虚拟多项式
+        let input_mle = Arc::new(input.evals_flat::<E>().into_mle());  // 输入x的MLE
+        let grad_mle = Arc::new(output_grad.evals_flat::<E>().into_mle());  // 输入梯度的MLE
         
         let num_vars = input_mle.num_vars();
         let mut vp = VirtualPolynomial::<E>::new(num_vars);
+        
+        // 固定变量以匹配上一步的证明
+        let fixed_input_mle = Arc::new(input_mle.fix_variables(&last_claim.point));
+        
+        // 构建relu'(x)的多线性扩展，使用克隆的derivs_base
+        let relu_deriv_mle = DenseMultilinearExtension::from_evaluations_vec(
+            num_vars,
+            derivs_base_clone  // 使用克隆的导数值
+        );
+
+        // 添加多项式约束
         vp.add_mle_list(
-            vec![input_mle.into(), grad_mle.into()],
-            E::ONE,
+            vec![
+                fixed_input_mle.clone(),    // 输入x的MLE
+                grad_mle.clone(),           // 输入梯度的MLE
+                Arc::new(relu_deriv_mle),   // relu'(x)的MLE
+            ],
+            E::ONE,  // 系数为1
         );
 
-        // 使用正确的verify函数和参数
+        // 第四步：验证sumcheck证明
         let subclaim = IOPVerifierState::verify(
-            proof.individual_to_virtual_claim(), // claimed sum
-            &proof.sumcheck,                     // sumcheck proof
-            &info.matrix_poly_aux,              // aux info
-            verifier.transcript,                 // transcript
+            proof.individual_to_virtual_claim(),  // 声称的和
+            &proof.sumcheck,                      // sumcheck证明
+            &info.matrix_poly_aux,               // 辅助信息
+            verifier.transcript,                  // transcript
         );
 
-        // 验证最终的评估值
+        // 第五步：验证最终的评估值
         ensure!(
             proof.individual_to_virtual_claim() == subclaim.expected_evaluation,
             "sumcheck claim failed"
         );
 
+        // 第六步：验证个别多项式的评估值满足约束
+        ensure!(
+            proof.individual_claims[1] * proof.individual_claims[2] == proof.individual_claims[0],
+            "Individual polynomial evaluations do not satisfy the constraint"
+        );
+
+        // 返回最终的声明
         Ok(Claim {
             point: subclaim.point_flat(),
-            eval: proof.individual_claims[1],
+            eval: proof.individual_claims[1],  // 返回梯度的评估值
         })
+    }
+}
+
+impl Default for ContextAux {
+    fn default() -> Self {
+        Self {
+            tables: BTreeSet::new(),
+            last_output_shape: Vec::new(),
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::to_bit_sequence_le;
-    use goldilocks::GoldilocksExt2;
-    use itertools::Itertools;
-    use multilinear_extensions::mle::{DenseMultilinearExtension, MultilinearExtension};
-
+    use crate::{
+        to_bit_sequence_le,
+        tensor::Tensor,
+        Claim, Prover,
+        iop::{context::Context, verifier::Verifier},
+        layers::{LayerProof, PolyID},
+        Element,
+        lookup::context::TableType,
+        model::Model,
+    };
     use super::*;
+    use goldilocks::{GoldilocksExt2, Goldilocks};
+    use itertools::Itertools;
+    use multilinear_extensions::{
+        mle::{DenseMultilinearExtension, MultilinearExtension},
+        virtual_poly::VPAuxInfo,
+    };
+    use transcript::BasicTranscript;
+    use std::collections::BTreeSet;
+    use ff::Field;
 
     type F = GoldilocksExt2;
+
+    #[test]
+    fn test_field_conversion_and_arithmetic() {
+        println!("\n=== 基本数值转换和运算测试 ===");
+        
+        // 1. 测试基本数值转换
+        let test_values = vec![-2, -1, 0, 1, 2];
+        println!("\n1. 原始值到有限域的转换:");
+        for &x in &test_values {
+            let field_val: F = Element::from(x).to_field();
+            println!("原始值 {} -> 域元素 {:?}", x, field_val);
+            
+            // 验证转换回Element
+            let element_val = field_val.into_element();
+            println!("域元素 {:?} -> 转回原始值 {}", field_val, element_val);
+            assert_eq!(x, element_val, "转换应该是可逆的");
+        }
+
+        // 2. 测试有限域运算
+        println!("\n2. 有限域运算测试:");
+        // 测试 2 * 3
+        let a: F = Element::from(2).to_field();
+        let b: F = Element::from(3).to_field();
+        let c = a * b;
+        println!("2 * 3 = {:?}", c);
+        println!("转回原始值: {}", c.into_element());
+        
+        // 测试 -2 * 3
+        let a: F = Element::from(-2).to_field();
+        let b: F = Element::from(3).to_field();
+        let c = a * b;
+        println!("-2 * 3 = {:?}", c);
+        println!("转回原始值: {}", c.into_element());
+
+        // 3. 测试ReLU导数计算
+        println!("\n3. ReLU导数计算测试:");
+        let test_inputs = vec![-2, -1, 0, 1, 2];
+        for &x in &test_inputs {
+            let input_field: F = Element::from(x).to_field();
+            let deriv = if x > 0 { 1 } else { 0 };
+            let deriv_field: F = Element::from(deriv).to_field();
+            println!("输入: {}, ReLU导数: {}", x, deriv);
+            println!("域中表示 - 输入: {:?}, 导数: {:?}", input_field, deriv_field);
+        }
+
+        // 4. 测试梯度计算
+        println!("\n4. 梯度计算测试:");
+        let grad_out = 2;  // 输出梯度
+        let test_inputs = vec![-1, 1];  // 测试负数和正数的情况
+        for &x in &test_inputs {
+            let grad_out_field: F = Element::from(grad_out).to_field();
+            let deriv = if x > 0 { 1 } else { 0 };
+            let deriv_field: F = Element::from(deriv).to_field();
+            let grad_in = grad_out_field * deriv_field;
+            println!("输入: {}, 输出梯度: {}, ReLU导数: {}", x, grad_out, deriv);
+            println!("计算得到的输入梯度: {:?}", grad_in);
+            println!("转回原始值: {}", grad_in.into_element());
+        }
+    }
 
     #[test]
     fn test_activation_relu_apply() {
@@ -423,35 +683,269 @@ mod test {
     fn test_relu_backward() {
         let relu = Relu::new();
 
-        // 测试用例1: 正数输入
+        // 测试用例1: 基本正数输入
+        // 计算过程:
+        // 1. 输入 [1,2,3] 都大于0，所以ReLU导数都为1: [1,1,1]
+        // 2. 输出梯度 [1,1,1]
+        // 3. 最终梯度 = 输出梯度 * ReLU导数 = [1,1,1] * [1,1,1] = [1,1,1]
         let input1 = Tensor::new(vec![3], vec![1, 2, 3]);
         let output_grad1 = Tensor::new(vec![3], vec![1, 1, 1]);
         let input_grad1 = relu.backward(&output_grad1, &input1);
-        
-        // 正数输入，导数应该为1
-        assert_eq!(input_grad1.get_data(), vec![1, 1, 1]);
+        assert_eq!(input_grad1.get_data(), vec![1, 1, 1], "正数输入的梯度应该保持不变");
 
-        // 测试用例2: 混合输入
+        // 测试用例2: 混合输入(正数、负数、零)
+        // 计算过程:
+        // 1. 输入 [-1,0,1] 的ReLU导数: [-1 -> 0, 0 -> 0, 1 -> 1] = [0,0,1]
+        // 2. 输出梯度 [2,2,2]
+        // 3. 最终梯度 = [2,2,2] * [0,0,1] = [0,0,2]
         let input2 = Tensor::new(vec![3], vec![-1, 0, 1]);
         let output_grad2 = Tensor::new(vec![3], vec![2, 2, 2]);
         let input_grad2 = relu.backward(&output_grad2, &input2);
+        assert_eq!(input_grad2.get_data(), vec![0, 0, 2], "负数和零的梯度应该为0，正数应该保持梯度");
+
+        // 测试用例3: 极端值测试
+        // 计算过程:
+        // 1. 输入 [MAX,MIN,0,1] 的ReLU导数: [MAX -> 1, MIN -> 0, 0 -> 0, 1 -> 1] = [1,0,0,1]
+        // 2. 输出梯度 [1,1,1,1]
+        // 3. 最终梯度 = [1,1,1,1] * [1,0,0,1] = [1,0,0,1]
+        let input3 = Tensor::new(vec![4], vec![*quantization::MAX, *quantization::MIN, 0, 1]);
+        let output_grad3 = Tensor::new(vec![4], vec![1, 1, 1, 1]);
+        let input_grad3 = relu.backward(&output_grad3, &input3);
+        assert_eq!(input_grad3.get_data(), vec![1, 0, 0, 1], "最大值应该传递梯度，最小值应该阻断梯度");
+
+        // 测试用例4: 多维输入(2x3矩阵)
+        // 计算过程:
+        // 1. 输入矩阵 [[1,-1,0],[-2,2,3]] 的ReLU导数:
+        //    [[1 -> 1, -1 -> 0, 0 -> 0],
+        //     [-2 -> 0, 2 -> 1, 3 -> 1]] = [[1,0,0],[0,1,1]]
+        // 2. 输出梯度矩阵 [[2,2,2],[2,2,2]]
+        // 3. 最终梯度 = [[2,2,2],[2,2,2]] * [[1,0,0],[0,1,1]] = [[2,0,0],[0,2,2]]
+        let input4 = Tensor::new(vec![2, 3], vec![1, -1, 0, -2, 2, 3]);
+        let output_grad4 = Tensor::new(vec![2, 3], vec![2, 2, 2, 2, 2, 2]);
+        let input_grad4 = relu.backward(&output_grad4, &input4);
+        assert_eq!(input_grad4.get_data(), vec![2, 0, 0, 0, 2, 2], "多维输入应该正确处理每个元素的梯度");
+        assert_eq!(input_grad4.get_shape(), vec![2, 3], "输出梯度应该保持输入的形状");
+
+        // 测试用例5: 全零输入
+        // 计算过程:
+        // 1. 输入 [0,0,0] 的ReLU导数: [0 -> 0, 0 -> 0, 0 -> 0] = [0,0,0]
+        // 2. 输出梯度 [1,1,1]
+        // 3. 最终梯度 = [1,1,1] * [0,0,0] = [0,0,0]
+        let input5 = Tensor::new(vec![3], vec![0, 0, 0]);
+        let output_grad5 = Tensor::new(vec![3], vec![1, 1, 1]);
+        let input_grad5 = relu.backward(&output_grad5, &input5);
+        assert_eq!(input_grad5.get_data(), vec![0, 0, 0], "零输入应该完全阻断梯度");
+
+        // 测试用例6: 全负数输入
+        // 计算过程:
+        // 1. 输入 [-1,-2,-3] 的ReLU导数: [-1 -> 0, -2 -> 0, -3 -> 0] = [0,0,0]
+        // 2. 输出梯度 [1,1,1]
+        // 3. 最终梯度 = [1,1,1] * [0,0,0] = [0,0,0]
+        let input6 = Tensor::new(vec![3], vec![-1, -2, -3]);
+        let output_grad6 = Tensor::new(vec![3], vec![1, 1, 1]);
+        let input_grad6 = relu.backward(&output_grad6, &input6);
+        assert_eq!(input_grad6.get_data(), vec![0, 0, 0], "负数输入应该完全阻断梯度");
+
+        // 测试用例7: 不同大小的梯度
+        // 计算过程:
+        // 1. 输入 [1,2,-1,3] 的ReLU导数: [1 -> 1, 2 -> 1, -1 -> 0, 3 -> 1] = [1,1,0,1]
+        // 2. 输出梯度 [4,3,2,1]
+        // 3. 最终梯度 = [4,3,2,1] * [1,1,0,1] = [4,3,0,1]
+        let input7 = Tensor::new(vec![4], vec![1, 2, -1, 3]);
+        let output_grad7 = Tensor::new(vec![4], vec![4, 3, 2, 1]);
+        let input_grad7 = relu.backward(&output_grad7, &input7);
+        assert_eq!(input_grad7.get_data(), vec![4, 3, 0, 1], "应该正确处理不同大小的梯度");
+
+        // 测试用例8: 维度检查
+        // 这个测试验证当输入维度不匹配时是否会正确panic
+        // input8维度为[2]，而output_grad8维度为[3]，这应该触发panic
+        let input8 = Tensor::new(vec![2], vec![1, 1]);
+        let output_grad8 = Tensor::new(vec![3], vec![1, 1, 1]);
+        let result = std::panic::catch_unwind(|| {
+            relu.backward(&output_grad8, &input8);
+        });
+        assert!(result.is_err(), "维度不匹配应该导致panic");
+    }
+
+    #[test]
+    fn test_negative_multiplication() {
+        println!("\n=== 负数乘法测试 ===");
         
-        // 负数和零的导数为0，正数的导数为1
-        assert_eq!(
-            input_grad2.get_data(),
-            vec![0, 0, 2] // -1 -> 0, 0 -> 0, 1 -> 2(=2*1)
-        );
+        // 测试 -2 * -1 = 2 的情况
+        let input = Tensor::new(vec![1], vec![-2]);
+        let output_grad = Tensor::new(vec![1], vec![-1]);
+        
+        println!("1. 原始值:");
+        println!("输入: -2");
+        println!("输出梯度: -1");
+        
+        // 转换为域元素
+        let input_field: F = Element::from(-2).to_field();
+        let grad_field: F = Element::from(-1).to_field();
+        let result_field = input_field * grad_field;
+        
+        println!("\n2. 域元素表示:");
+        println!("输入(-2)在域中: {:?}", input_field);
+        println!("梯度(-1)在域中: {:?}", grad_field);
+        println!("乘法结果在域中: {:?}", result_field);
+        
+        // 转换回原始值
+        let result: Element = result_field.into_element();
+        println!("\n3. 最终结果:");
+        println!("转换回原始值: {}", result);
+        
+        assert_eq!(result, 2, "(-2) * (-1) 应该等于 2");
+        println!("=== 负数乘法测试结束 ===\n");
     }
 
     #[test]
     fn test_activation_backward_proof() {
-        // 创建测试数据
+        // 设置基本测试数据
         let relu = Relu::new();
-        let input = Tensor::new(vec![2], vec![1, -1]);  // 一个正数一个负数
-        let output_grad = Tensor::new(vec![2], vec![1, 1]);
         
-        // 验证backward计算的正确性
-        let grad = relu.backward(&output_grad, &input);
-        assert_eq!(grad.get_data(), vec![1, 0]);  // 期望 [1, 0]，因为只有正数处导数为1
+        // 创建与ReLU多项式长度匹配的输入张量
+        let poly_len = Relu::poly_len();
+        println!("ReLU多项式长度: {}", poly_len);
+        
+        // 创建一个填充到多项式长度的输入张量
+        let mut input_data = vec![0; poly_len];
+        input_data[0] = 1;  // 设置第一个元素为正数
+        input_data[1] = -1; // 设置第二个元素为负数
+        let input = Tensor::new(vec![poly_len], input_data);
+        
+        // 创建对应的梯度张量
+        let mut grad_data = vec![0; poly_len];
+        grad_data[0] = 2;  // 对应第一个元素的梯度
+        grad_data[1] = 2;  // 对应第二个元素的梯度
+        let output_grad = Tensor::new(vec![poly_len], grad_data);
+        
+        println!("输入张量: {:?}", input.get_data());
+        println!("梯度张量: {:?}", output_grad.get_data());
+
+        // 创建transcript
+        let mut transcript = BasicTranscript::new(b"test_activation_backward");
+        
+        // 初始化模型和上下文
+        let mut model = Model::new();
+        let input_shape = vec![poly_len];
+        model.set_input_shape(input_shape.clone());  // 明确设置输入形状
+        println!("设置的模型输入形状: {:?}", input_shape);
+        
+        // 添加一个Dense层，确保有多项式需要提交
+        let dense = Layer::Dense(Dense::new(
+            Tensor::new(vec![poly_len, poly_len], vec![1; poly_len * poly_len]),  // 全1矩阵
+            Tensor::new(vec![poly_len], vec![0; poly_len])  // 零偏置
+        ));
+        model.add_layer::<F>(dense);
+        println!("添加Dense层完成");
+        
+        // 添加ReLU层
+        let layer = Layer::Activation(Activation::Relu(relu));
+        model.add_layer::<F>(layer);
+        println!("添加ReLU层完成");
+        
+        // 生成上下文
+        let mut aux = ContextAux::default();
+        aux.last_output_shape = input_shape.clone();  // 设置输出形状
+        aux.tables.insert(TableType::Relu);  // 确保添加ReLU表
+        println!("上下文输出形状: {:?}", aux.last_output_shape);
+        println!("上下文表类型: {:?}", aux.tables);
+        
+        let context = match Context::<F>::generate(&model, Some(input_shape.clone())) {
+            Ok(ctx) => {
+                println!("上下文生成成功");
+                ctx
+            },
+            Err(e) => {
+                println!("上下文生成失败: {:?}", e);
+                panic!("上下文生成失败");
+            }
+        };
+        
+        let mut prover = Prover::new(&context, &mut transcript);
+        println!("Prover创建成功");
+
+        // 创建必要的上下文和初始声明
+        let input_poly_id = 1;  // 使用1作为多项式ID，因为0已经被Dense层使用
+        let matrix_poly_aux = VPAuxInfo::default();
+        let info = ActivationBackwardCtx {
+            input_poly_id,
+            matrix_poly_aux,
+        };
+        println!("使用的多项式ID: {}", input_poly_id);
+
+        // 生成初始声明
+        let num_vars = Relu::num_vars();
+        println!("计算的变量数: {}", num_vars);
+        let initial_claim = Claim {
+            point: vec![F::ONE; num_vars],  // 创建正确长度的点向量
+            eval: F::ONE,
+        };
+        println!("初始声明点向量长度: {}", initial_claim.point.len());
+
+        // 生成证明
+        println!("开始生成证明...");
+        let proof_result = Activation::Relu(relu).prove_backward_step(
+            &mut prover,
+            initial_claim.clone(),
+            &output_grad,
+            &input,
+            &info,
+        );
+        
+        match &proof_result {
+            Ok(_) => println!("证明生成成功"),
+            Err(e) => println!("证明生成失败: {:?}", e),
+        }
+        assert!(proof_result.is_ok(), "证明生成应该成功");
+
+        // 创建推理跟踪
+        println!("开始创建推理跟踪...");
+        let trace = model.run_feedforward(input.clone());
+        println!("推理跟踪创建成功");
+
+        // 生成完整的证明
+        println!("开始生成完整证明...");
+        let proof = match prover.prove(trace) {
+            Ok(p) => {
+                println!("完整证明生成成功");
+                p
+            },
+            Err(e) => {
+                println!("完整证明生成失败: {:?}", e);
+                panic!("完整证明生成失败");
+            }
+        };
+
+        // 验证证明
+        println!("开始验证证明...");
+        let mut verifier_transcript = BasicTranscript::new(b"test_activation_backward");
+        let mut verifier = Verifier::new(&mut verifier_transcript);
+        println!("验证器创建成功");
+        
+        if let Ok(final_claim) = proof_result {
+            let input_for_io = input.clone();
+            let output_grad_for_io = output_grad.clone();
+            
+            println!("开始验证过程...");
+            let verify_result = verify(
+                context,
+                proof,
+                IO::new(input_for_io.to_fields(), output_grad_for_io.to_fields()),
+                &mut verifier_transcript
+            );
+            
+            match &verify_result {
+                Ok(_) => println!("验证成功"),
+                Err(e) => println!("验证失败: {:?}", e),
+            }
+            assert!(verify_result.is_ok(), "验证应该成功");
+
+            // 验证实际梯度计算是否正确
+            let expected_grad = relu.backward(&output_grad, &input);
+            println!("期望的梯度: {:?}", expected_grad.get_data());
+            // 只检查前两个元素的梯度，因为其他元素都是0
+            assert_eq!(expected_grad.get_data()[0..2], vec![2, 0], "梯度计算应该正确：正值(1)保持梯度2，负值(-1)梯度为0");
+        }
     }
 }

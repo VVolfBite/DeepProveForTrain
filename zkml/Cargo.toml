@@ -20,7 +20,7 @@ ff.workspace = true
 ff_ext = { version = "0.1.0", path = "../ff_ext" }
 gkr = { version = "0.1.0", path = "../gkr" }
 goldilocks.workspace = true
-itertools.workspace = true
+itertools = "0.12"
 mpcs = { version = "0.1.0", path = "../mpcs" }
 multilinear_extensions = { version = "0.1.0", path = "../multilinear_extensions", features = [
     "parallel",
@@ -40,3 +40,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 tract-onnx = "0.21.9"
 transcript = { version = "0.1.0", path = "../transcript" }
+libc = "0.2"
+nix = { version = "0.26", features = ["signal"] }
