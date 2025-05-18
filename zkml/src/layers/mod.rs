@@ -55,6 +55,21 @@ pub enum Layer<T> {
     Reshape(Reshape),
 }
 
+/// 训练相关的trait，用于实现各种层的训练功能
+pub trait Train<T: Number> {
+    /// 前向计算，输入一批数据，输出结果
+    fn forward(&self, input: &Tensor<T>) -> Tensor<T>;
+
+    /// 反向计算，计算梯度或反向层
+    fn backward(&mut self, input: &Tensor<T>, grad_output: &Tensor<T>) -> Tensor<T>;
+
+    /// 根据梯度更新参数
+    fn update(&mut self, learning_rate: T);
+
+    /// 清零梯度
+    fn zero_grad(&mut self);
+}
+
 /// Describes a steps wrt the polynomial to be proven/looked at. Verifier needs to know
 /// the sequence of steps and the type of each step from the setup phase so it can make sure the prover is not
 /// cheating on this.
@@ -379,5 +394,38 @@ where
 impl<T: Number> std::fmt::Display for Layer<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.describe())
+    }
+}
+
+impl<T: Number> Train<T> for Layer<T> {
+    fn forward(&self, input: &Tensor<T>) -> Tensor<T> {
+        match self {
+            Layer::Dense(dense) => dense.forward(input),
+            Layer::Activation(activation) => activation.forward(input),
+            _ => input.clone(),
+        }
+    }
+
+    fn backward(&mut self, input: &Tensor<T>, grad_output: &Tensor<T>) -> Tensor<T> {
+        match self {
+            Layer::Dense(dense) => dense.backward(input, grad_output),
+            Layer::Activation(activation) => activation.backward(input, grad_output),
+            _ => grad_output.clone(),
+        }
+    }
+
+    fn update(&mut self, learning_rate: T) {
+        match self {
+            Layer::Dense(dense) => dense.update(learning_rate),
+            Layer::Activation(activation) => activation.update(learning_rate),
+            _ => {},
+        }
+    }
+
+    fn zero_grad(&mut self) {
+        match self {
+            Layer::Dense(dense) => dense.zero_grad(),
+            _ => {},
+        }
     }
 }

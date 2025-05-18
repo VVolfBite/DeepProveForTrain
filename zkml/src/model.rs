@@ -1,6 +1,6 @@
 use crate::{
     Element,
-    layers::{Layer, LayerOutput},
+    layers::{Layer, LayerOutput, Train},
     padding::PaddingMode,
     quantization::{ModelMetadata, TensorFielder},
     tensor::{ConvData, Number, Tensor},
@@ -14,9 +14,48 @@ use tracing::info;
 // The index of the step, starting from the input layer. (proving is done in the opposite flow)
 pub type StepIdx = usize;
 
+/// 损失函数类型
+#[derive(Debug, Clone, Copy)]
+pub enum LossFunction<T> {
+    /// 平方误差损失
+    SquaredError,
+    /// 交叉熵损失（仅适用于概率输出，如 Softmax 后）
+    CrossEntropy,
+    /// 自定义损失函数
+    Custom(fn(&Tensor<T>, &Tensor<T>) -> T),
+}
+
+/// 每一层反向传播后的梯度信息
+pub struct LayerGradient<T> {
+    /// 当前层输入的梯度（用于往前传）
+    pub input_grad: Tensor<T>,
+
+    /// 当前层参数的梯度（如权重/偏置），无则为 None
+    pub param_grad: Option<LayerParamGradient<T>>,
+}
+
+/// 用于描述各种层参数的梯度（不同层可能结构不同）
+pub enum LayerParamGradient<T> {
+    Dense {
+        weights_grad: Tensor<T>,
+        bias_grad: Tensor<T>,
+    },
+    Convolution {
+        kernel_grad: Tensor<T>,
+        bias_grad: Tensor<T>,
+    },
+    SchoolBookConvolution {
+        kernel_grad: Tensor<T>,
+        bias_grad: Tensor<T>,
+    },
+    // 其他层可能不需要梯度，比如 Activation, Requant, Reshape
+}
+
 /// NOTE: this doesn't handle dynamism in the model with loops for example for LLMs where it
 /// produces each token one by one.
 #[derive(Clone, Debug)]
+
+
 pub struct Model<T> {
     pub unpadded_input: Vec<usize>,
     pub(crate) padded_input: Vec<usize>,
@@ -136,6 +175,110 @@ impl<T: Number> Model<T> {
 
     pub fn layer_count(&self) -> usize {
         self.layers.len()
+    }
+
+    /// 计算模型输出与目标值之间的损失
+    pub fn compute_loss(&self, prediction: &Tensor<T>, target: &Tensor<T>, loss_fn: LossFunction<T>) -> T {
+        match loss_fn {
+            LossFunction::SquaredError => {
+                assert_eq!(prediction.get_shape(), target.get_shape(), "预测值与目标值形状不一致");
+                let mut sum = T::default();
+                for (p, t) in prediction.get_data().iter().zip(target.get_data().iter()) {
+                    let diff = *p - *t;
+                    sum = sum + diff * diff;
+                }
+                sum
+            }
+            LossFunction::CrossEntropy => {
+                unimplemented!("CrossEntropy 损失函数尚未实现")
+            }
+            LossFunction::Custom(f) => f(prediction, target),
+        }
+    }
+
+    // 计算损失函数的梯度
+    fn compute_loss_gradient(&self, prediction: &Tensor<T>, target: &Tensor<T>, loss_fn: LossFunction<T>) -> Tensor<T> {
+        match loss_fn {
+            LossFunction::SquaredError => {
+                let mut grad_data = Vec::with_capacity(prediction.get_data().len());
+                for (p, t) in prediction.get_data().iter().zip(target.get_data().iter()) {
+                    let diff = *p - *t;
+                    grad_data.push(diff + diff);
+                }
+                Tensor::new(prediction.get_shape(), grad_data)
+            }
+            LossFunction::CrossEntropy => {
+                unimplemented!("CrossEntropy 反向传播尚未实现")
+            }
+            LossFunction::Custom(_) => {
+                unimplemented!("自定义损失函数的反向传播尚未实现")
+            }
+        }
+    }
+
+    // 前向传播并保存中间结果
+    pub fn forward_with_intermediates(&self, input: &Tensor<T>) -> (Tensor<T>, Vec<Tensor<T>>) {
+        let mut intermediate_outputs = Vec::new();
+        let mut current_input = self.prepare_input(input.clone());
+        intermediate_outputs.push(current_input.clone());
+        
+        for layer in &self.layers {
+            current_input = layer.forward(&current_input);
+            intermediate_outputs.push(current_input.clone());
+        }
+        
+        (current_input, intermediate_outputs)
+    }
+
+    // 计算损失和梯度
+    pub fn compute_loss_and_gradient(&self, output: &Tensor<T>, target: &Tensor<T>, loss_fn: LossFunction<T>) -> (T, Tensor<T>) {
+        let loss = self.compute_loss(output, target, loss_fn);
+        let grad = self.compute_loss_gradient(output, target, loss_fn);
+        (loss, grad)
+    }
+
+    // 反向传播
+    pub fn backward(&mut self, intermediate_outputs: &[Tensor<T>], grad: &Tensor<T>) -> Tensor<T> {
+        let mut current_grad = grad.clone();
+        
+        // 反向传播
+        for (layer, input) in self.layers.iter_mut().rev().zip(intermediate_outputs.iter().rev().skip(1)) {
+            current_grad = layer.backward(input, &current_grad);
+        }
+        
+        current_grad
+    }
+
+    /// 训练模型
+    pub fn train(
+        &mut self,
+        data: &[(Tensor<T>, Tensor<T>)], // 输入和标签对
+        loss_fn: LossFunction<T>,
+        optimizer: &mut dyn Optimizer<T>,
+        epochs: usize,
+    ) {
+        for epoch in 0..epochs {
+            let mut total_loss = T::default();
+            
+            // 遍历每个训练样本
+            for (input, target) in data.iter() {
+                // 前向传播并保存中间结果
+                let (output, intermediate_outputs) = self.forward_with_intermediates(input);
+                
+                // 计算损失和梯度
+                let (loss, grad) = self.compute_loss_and_gradient(&output, target, loss_fn.clone());
+                
+                // 反向传播
+                self.backward(&intermediate_outputs, &grad);
+                
+                // 更新参数
+                optimizer.step(&mut self.layers);
+                
+                total_loss = total_loss + loss;
+            }
+
+            println!("Epoch {}, loss: {:?}", epoch, total_loss);
+        }
     }
 }
 
@@ -394,6 +537,32 @@ impl Model<f32> {
             last_output = layer.run(&last_output);
         }
         last_output
+    }
+}
+
+/// 优化器 trait
+pub trait Optimizer<T: Number> {
+    /// 执行一步优化
+    fn step(&mut self, layers: &mut [Layer<T>]);
+}
+
+/// 随机梯度下降优化器
+pub struct SGD<T> {
+    /// 学习率
+    pub learning_rate: T,
+}
+
+impl<T: Number> SGD<T> {
+    pub fn new(learning_rate: T) -> Self {
+        Self { learning_rate }
+    }
+}
+
+impl<T: Number> Optimizer<T> for SGD<T> {
+    fn step(&mut self, layers: &mut [Layer<T>]) {
+        for layer in layers.iter_mut() {
+            layer.update(self.learning_rate);
+        }
     }
 }
 
@@ -949,5 +1118,389 @@ pub(crate) mod test {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layers::{Layer, activation::{Activation, Relu}, dense::Dense};
+    use crate::tensor::Tensor;
+    use crate::quantization::ScalingFactor;
+
+    #[test]
+    fn test_forward_simple_f32() {
+        // 创建网络结构
+        let mut model = Model::<f32>::new(&vec![4]); // 输入维度为4
+        
+        // 第一层：Dense (4 -> 3)
+        let weights1 = Tensor::<f32>::new(
+            vec![3, 4],
+            vec![
+                0.1, 0.2, 0.3, 0.4,
+                0.5, 0.6, 0.7, 0.8,
+                0.9, 1.0, 1.1, 1.2
+            ]
+        );
+        let bias1 = Tensor::<f32>::new(vec![3], vec![0.1, 0.2, 0.3]);
+        println!("\n=== 网络结构 ===");
+        println!("输入维度: 4");
+        println!("第一层: Dense(4 -> 3)");
+        println!("第二层: ReLU");
+        println!("第三层: Dense(3 -> 2)");
+        
+        println!("\n=== 第一层参数 ===");
+        println!("权重矩阵 (3x4):");
+        println!("{:?}", weights1.get_data());
+        println!("偏置向量: {:?}", bias1.get_data());
+        
+        let dense1 = Dense::<f32>::new(weights1, bias1);
+        model.add_layer(Layer::Dense(dense1));
+        
+        // 第二层：ReLU
+        model.add_layer(Layer::Activation(Activation::Relu(Relu::new())));
+        
+        // 第三层：Dense (3 -> 2)
+        let weights2 = Tensor::<f32>::new(
+            vec![2, 3],
+            vec![
+                0.1, 0.2, 0.3,
+                0.4, 0.5, 0.6
+            ]
+        );
+        let bias2 = Tensor::<f32>::new(vec![2], vec![0.1, 0.2]);
+        
+        println!("\n=== 第二层参数 ===");
+        println!("权重矩阵 (2x3):");
+        println!("{:?}", weights2.get_data());
+        println!("偏置向量: {:?}", bias2.get_data());
+        
+        let dense2 = Dense::<f32>::new(weights2, bias2);
+        model.add_layer(Layer::Dense(dense2));
+
+        // 创建测试输入
+        let input = Tensor::<f32>::new(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
+        println!("\n=== 输入数据 ===");
+        println!("输入向量: {:?}", input.get_data());
+        
+        // 执行前向传播
+        let (output, _) = model.forward_with_intermediates(&input);
+        
+        // 验证输出
+        assert_eq!(output.get_shape(), vec![2]);
+        
+        println!("\n=== 计算过程 ===");
+        println!("第一层计算:");
+        println!("node1 = 0.1*1 + 0.2*2 + 0.3*3 + 0.4*4 + 0.1 = 3.1");
+        println!("node2 = 0.5*1 + 0.6*2 + 0.7*3 + 0.8*4 + 0.2 = 7.2");
+        println!("node3 = 0.9*1 + 1.0*2 + 1.1*3 + 1.2*4 + 0.3 = 11.3");
+        println!("第一层输出: [3.1, 7.2, 11.3]");
+        
+        println!("\nReLU层:");
+        println!("ReLU([3.1, 7.2, 11.3]) = [3.1, 7.2, 11.3]");
+        
+        println!("\n第二层计算:");
+        println!("output1 = 0.1*3.1 + 0.2*7.2 + 0.3*11.3 + 0.1 = 5.24");
+        println!("output2 = 0.4*3.1 + 0.5*7.2 + 0.6*11.3 + 0.2 = 11.82");
+        
+        let expected_output = vec![5.24, 11.82];
+        let actual_output = output.get_data();
+        
+        println!("\n=== 最终结果 ===");
+        println!("期望输出: {:?}", expected_output);
+        println!("实际输出: {:?}", actual_output);
+        
+        // 使用近似比较，因为浮点数计算可能有微小误差
+        for (expected, actual) in expected_output.iter().zip(actual_output.iter()) {
+            assert!((expected - actual).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_squared_error_loss_f32() {
+        println!("\n=== 测试平方误差损失 (f32) ===");
+        
+        // 创建模型实例用于测试
+        let model = Model::<f32>::new(&vec![4]);
+        
+        // 创建测试数据
+        let prediction = Tensor::<f32>::new(vec![3], vec![1.0, 2.0, 3.0]);
+        let target = Tensor::<f32>::new(vec![3], vec![1.2, 1.8, 3.1]);
+        
+        println!("预测值: {:?}", prediction.get_data());
+        println!("目标值: {:?}", target.get_data());
+        
+        // 计算损失
+        let loss = model.compute_loss(&prediction, &target, LossFunction::<f32>::SquaredError);
+        
+        // 手动计算期望的损失值
+        let expected_loss = (1.0f32 - 1.2f32).powi(2) + (2.0f32 - 1.8f32).powi(2) + (3.0f32 - 3.1f32).powi(2);
+        println!("计算过程:");
+        println!("(1.0 - 1.2)² + (2.0 - 1.8)² + (3.0 - 3.1)²");
+        println!("= 0.04 + 0.04 + 0.01");
+        println!("= 0.09");
+        
+        println!("期望损失: {}", expected_loss);
+        println!("实际损失: {}", loss);
+        
+        // 验证结果
+        assert!((loss - expected_loss).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_backward_simple_f32() {
+        println!("\n=== 测试反向传播 (f32) ===");
+        
+        // 构建简单网络
+        let mut model = Model::<f32>::new(&vec![4]);
+        
+        // 第一层：Dense (4 -> 3)
+        let weights1 = Tensor::<f32>::new(
+            vec![3, 4],
+            vec![
+                0.1, 0.2, 0.3, 0.4,
+                0.5, 0.6, 0.7, 0.8,
+                0.9, 1.0, 1.1, 1.2
+            ]
+        );
+        let bias1 = Tensor::<f32>::new(vec![3], vec![0.1, 0.2, 0.3]);
+        println!("\n=== 第一层参数 ===");
+        println!("权重矩阵 (3x4):");
+        println!("{:?}", weights1.get_data());
+        println!("偏置向量: {:?}", bias1.get_data());
+        
+        let dense1 = Dense::<f32>::new(weights1, bias1);
+        model.add_layer(Layer::Dense(dense1));
+        
+        // 第二层：ReLU
+        model.add_layer(Layer::Activation(Activation::Relu(Relu::new())));
+        
+        // 第三层：Dense (3 -> 2)
+        let weights2 = Tensor::<f32>::new(
+            vec![2, 3],
+            vec![
+                0.1, 0.2, 0.3,
+                0.4, 0.5, 0.6
+            ]
+        );
+        let bias2 = Tensor::<f32>::new(vec![2], vec![0.1, 0.2]);
+        println!("\n=== 第二层参数 ===");
+        println!("权重矩阵 (2x3):");
+        println!("{:?}", weights2.get_data());
+        println!("偏置向量: {:?}", bias2.get_data());
+        
+        let dense2 = Dense::<f32>::new(weights2, bias2);
+        model.add_layer(Layer::Dense(dense2));
+
+        // 输入和目标
+        let input = Tensor::<f32>::new(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
+        let target = Tensor::<f32>::new(vec![2], vec![5.0, 10.0]);
+        
+        println!("\n=== 输入数据 ===");
+        println!("输入向量: {:?}", input.get_data());
+        println!("目标向量: {:?}", target.get_data());
+        
+        // 执行前向传播并保存中间结果
+        let (output, intermediate_outputs) = model.forward_with_intermediates(&input);
+        println!("\n=== 前向传播过程 ===");
+        for (i, output) in intermediate_outputs.iter().enumerate() {
+            println!("第{}层输出: {:?}", i, output.get_data());
+        }
+        
+        // 计算损失和梯度
+        let (loss, grad) = model.compute_loss_and_gradient(&output, &target, LossFunction::<f32>::SquaredError);
+        
+        println!("\n=== 反向传播结果 ===");
+        println!("计算得到的损失: {}", loss);
+        
+        // 验证损失计算
+        let expected_loss = (5.24f32 - 5.0f32).powi(2) + (11.82f32 - 10.0f32).powi(2);
+        println!("期望损失: {}", expected_loss);
+        println!("损失计算过程:");
+        println!("(5.24 - 5.0)² + (11.82 - 10.0)²");
+        println!("= 0.0576 + 3.3124");
+        println!("= 3.37");
+        
+        assert!((loss - expected_loss).abs() < 1e-5);
+        
+        // 执行反向传播
+        model.backward(&intermediate_outputs, &grad);
+        
+        // 创建优化器并更新参数
+        let learning_rate = 0.01f32;
+        let mut optimizer = SGD::new(learning_rate);
+        println!("\n=== 参数更新 ===");
+        println!("学习率: {}", learning_rate);
+        
+        // 使用优化器更新参数
+        optimizer.step(&mut model.layers);
+        
+        // 打印更新后的参数
+        println!("\n=== 更新后的参数 ===");
+        
+        // 检查第一层参数
+        if let Layer::Dense(dense) = &model.layers[0] {
+            println!("\n第一层参数:");
+            println!("权重矩阵: {:?}", dense.matrix.get_data());
+            println!("偏置向量: {:?}", dense.bias.get_data());
+            
+            // 验证第一层权重更新
+            let expected_weights = vec![
+                0.084960006, 0.16992001, 0.25488, 0.33984002,
+                0.48084, 0.56168, 0.64252, 0.72336,
+                0.87671995, 0.95344, 1.0301601, 1.1068801
+            ];
+            for (expected, actual) in expected_weights.iter().zip(dense.matrix.get_data().iter()) {
+                assert!((expected - actual).abs() < 1e-5, 
+                    "第一层权重更新不正确: 期望 {}, 实际 {}", expected, actual);
+            }
+            
+            // 验证第一层偏置更新
+            let expected_bias = vec![0.084960006, 0.18084, 0.27672002];
+            for (expected, actual) in expected_bias.iter().zip(dense.bias.get_data().iter()) {
+                assert!((expected - actual).abs() < 1e-5,
+                    "第一层偏置更新不正确: 期望 {}, 实际 {}", expected, actual);
+            }
+        }
+        
+        // 检查第二层参数
+        if let Layer::Dense(dense) = &model.layers[2] {
+            println!("\n第二层参数:");
+            println!("权重矩阵: {:?}", dense.matrix.get_data());
+            println!("偏置向量: {:?}", dense.bias.get_data());
+            
+            // 验证第二层权重更新
+            let expected_weights = vec![
+                0.085120015, 0.16544004, 0.24576007,
+                0.28716004, 0.23792008, 0.18868011
+            ];
+            for (expected, actual) in expected_weights.iter().zip(dense.matrix.get_data().iter()) {
+                assert!((expected - actual).abs() < 1e-5,
+                    "第二层权重更新不正确: 期望 {}, 实际 {}", expected, actual);
+            }
+            
+            // 验证第二层偏置更新
+            let expected_bias = vec![0.09520001, 0.16360001];
+            for (expected, actual) in expected_bias.iter().zip(dense.bias.get_data().iter()) {
+                assert!((expected - actual).abs() < 1e-5,
+                    "第二层偏置更新不正确: 期望 {}, 实际 {}", expected, actual);
+            }
+        }
+        
+        // 验证中间层输出
+        println!("\n=== 中间层输出验证 ===");
+        for (i, output) in intermediate_outputs.iter().enumerate() {
+            println!("第{}层输出: {:?}", i + 1, output.get_data());
+            // 确保输出值在合理范围内
+            for (j, &value) in output.get_data().iter().enumerate() {
+                assert!(value.is_finite(), "第{}层输出[{}]不是有限数: {}", i + 1, j, value);
+            }
+        }
+    }
+
+    #[test]
+    fn test_forward_simple_element() {
+        println!("\n=== 测试简单网络(Element类型) ===");
+        
+        // 创建统一的量化因子
+        let sf = ScalingFactor::from_scale(0.091, None);
+        
+        // 创建网络结构
+        let mut model = Model::<Element>::new(&vec![4]); // 输入维度为4
+        
+        // 第一层：Dense (4 -> 3)
+        let weights1 = Tensor::<f32>::new(
+            vec![3, 4],
+            vec![
+                0.1, 0.2, 0.3, 0.4,
+                0.5, 0.6, 0.7, 0.8,
+                0.9, 1.0, 1.1, 1.2
+            ]
+        );
+        let bias1 = Tensor::<f32>::new(vec![3], vec![0.1, 0.2, 0.3]);
+        
+        println!("\n=== 第一层参数 ===");
+        println!("原始权重矩阵 (3x4):");
+        println!("{:?}", weights1.get_data());
+        println!("原始偏置向量: {:?}", bias1.get_data());
+        
+        // 使用统一的量化因子
+        let weights1_quant = weights1.quantize(&sf);
+        let bias1_quant = bias1.quantize(&sf);
+        
+        println!("量化后权重矩阵 (3x4):");
+        println!("{:?}", weights1_quant.get_data());
+        println!("量化后偏置向量: {:?}", bias1_quant.get_data());
+        
+        let dense1 = Dense::<Element>::new(weights1_quant, bias1_quant);
+        model.add_layer(Layer::Dense(dense1));
+        
+        // 第二层：ReLU
+        model.add_layer(Layer::Activation(Activation::Relu(Relu::new())));
+        
+        // 第三层：Dense (3 -> 2)
+        let weights2 = Tensor::<f32>::new(
+            vec![2, 3],
+            vec![
+                0.1, 0.2, 0.3,
+                0.4, 0.5, 0.6
+            ]
+        );
+        let bias2 = Tensor::<f32>::new(vec![2], vec![0.1, 0.2]);
+        
+        println!("\n=== 第二层参数 ===");
+        println!("原始权重矩阵 (2x3):");
+        println!("{:?}", weights2.get_data());
+        println!("原始偏置向量: {:?}", bias2.get_data());
+        
+        // 使用统一的量化因子
+        let weights2_quant = weights2.quantize(&sf);
+        let bias2_quant = bias2.quantize(&sf);
+        
+        println!("量化后权重矩阵 (2x3):");
+        println!("{:?}", weights2_quant.get_data());
+        println!("量化后偏置向量: {:?}", bias2_quant.get_data());
+        
+        let dense2 = Dense::<Element>::new(weights2_quant, bias2_quant);
+        model.add_layer(Layer::Dense(dense2));
+
+        // 创建测试输入并使用统一的量化因子
+        let input_f32 = Tensor::<f32>::new(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
+        let input = input_f32.clone().quantize(&sf);
+        
+        println!("\n=== 输入数据 ===");
+        println!("原始输入向量: {:?}", input_f32.get_data());
+        println!("量化后输入向量: {:?}", input.get_data());
+        
+        // 执行前向传播
+        let (output, _) = model.forward_with_intermediates(&input);
+        
+        // 验证输出
+        assert_eq!(output.get_shape(), vec![2]);
+        
+        println!("\n=== 计算过程 ===");
+        println!("第一层计算:");
+        println!("node1 = 0.1*1 + 0.2*2 + 0.3*3 + 0.4*4 + 0.1 = 3.1");
+        println!("node2 = 0.5*1 + 0.6*2 + 0.7*3 + 0.8*4 + 0.2 = 7.2");
+        println!("node3 = 0.9*1 + 1.0*2 + 1.1*3 + 1.2*4 + 0.3 = 11.3");
+        println!("第一层输出: [3.1, 7.2, 11.3]");
+        
+        println!("\nReLU层:");
+        println!("ReLU([3.1, 7.2, 11.3]) = [3.1, 7.2, 11.3]");
+        
+        println!("\n第二层计算:");
+        println!("output1 = 0.1*3.1 + 0.2*7.2 + 0.3*11.3 + 0.1 = 5.24");
+        println!("output2 = 0.4*3.1 + 0.5*7.2 + 0.6*11.3 + 0.2 = 11.82");
+        
+        let expected_output = vec![5.24, 11.82];
+        let actual_output = output.get_data();
+        
+        println!("\n=== 最终结果 ===");
+        println!("期望输出: {:?}", expected_output);
+        println!("量化后输出: {:?}", actual_output);
+        
+        // 反量化输出
+        let output_f32 = output.dequantize(&sf);
+        println!("反量化输出: {:?}", output_f32.get_data());
     }
 }

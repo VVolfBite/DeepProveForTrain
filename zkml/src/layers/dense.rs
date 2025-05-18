@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use crate::{
     Claim, Prover,
     iop::{context::ContextAux, verifier::Verifier},
-    layers::{LayerCtx, LayerProof, PolyID},
+    layers::{LayerCtx, LayerProof, PolyID, Train},
     padding::PaddingMode,
     quantization::{self, ScalingFactor},
     tensor::Number,
@@ -35,6 +35,11 @@ pub struct Dense<T> {
     pub bias: Tensor<T>,
     // set to matrix shape if the matrix is not padded
     pub unpadded_matrix_shape: Vec<usize>,
+    // 训练相关的字段
+    #[serde(skip)]
+    pub grad_matrix: Option<Tensor<T>>,
+    #[serde(skip)]
+    pub grad_bias: Option<Tensor<T>>,
 }
 
 /// Information stored in the context (setup phase) for this layer.
@@ -70,6 +75,8 @@ impl<T: Number> Dense<T> {
             matrix,
             bias,
             unpadded_matrix_shape,
+            grad_matrix: None,
+            grad_bias: None,
         }
     }
     pub fn ncols(&self) -> usize {
@@ -96,6 +103,8 @@ impl<T: Number> Dense<T> {
             matrix,
             bias,
             unpadded_matrix_shape: self.unpadded_matrix_shape.to_vec(),
+            grad_matrix: self.grad_matrix,
+            grad_bias: self.grad_bias,
         }
     }
 
@@ -129,10 +138,14 @@ impl Dense<f32> {
     pub fn quantize(self, s: &ScalingFactor, bias_s: &ScalingFactor) -> Dense<Element> {
         let matrix = self.matrix.quantize(s);
         let bias = self.bias.quantize(bias_s);
+        let grad_matrix = self.grad_matrix.map(|g| g.quantize(s));
+        let grad_bias = self.grad_bias.map(|g| g.quantize(bias_s));
         Dense::<Element> {
             matrix,
             bias,
             unpadded_matrix_shape: self.unpadded_matrix_shape.to_vec(),
+            grad_matrix,
+            grad_bias,
         }
     }
 
@@ -142,6 +155,8 @@ impl Dense<f32> {
             matrix: weights,
             bias,
             unpadded_matrix_shape,
+            grad_matrix: None,
+            grad_bias: None,
         }
     }
 
@@ -430,6 +445,124 @@ impl<E: ExtensionField> DenseProof<E> {
     }
 }
 
+impl<T: Number> Train<T> for Dense<T> {
+    fn forward(&self, input: &Tensor<T>) -> Tensor<T> {
+        self.op(input)
+    }
+
+    fn backward(&mut self, input_tensor: &Tensor<T>, grad_output: &Tensor<T>) -> Tensor<T> {
+        // 1. 处理输入形状
+        let input_2d = if input_tensor.get_shape().len() == 1 {
+            Tensor::new(
+                vec![1, input_tensor.get_data().len()],
+                input_tensor.get_data().to_vec()
+            )
+        } else {
+            Tensor::new(
+                input_tensor.get_shape().to_vec(),
+                input_tensor.get_data().to_vec()
+            )
+        };
+
+        let grad_output_2d = if grad_output.get_shape().len() == 1 {
+            Tensor::new(
+                vec![1, grad_output.get_data().len()],
+                grad_output.get_data().to_vec()
+            )
+        } else {
+            Tensor::new(
+                grad_output.get_shape().to_vec(),
+                grad_output.get_data().to_vec()
+            )
+        };
+
+        // 2. 检查维度匹配
+        let batch_size = input_2d.get_shape()[0];
+        let input_size = input_2d.get_shape()[1];
+        let output_size = self.matrix.nrows_2d();
+
+        assert_eq!(
+            grad_output_2d.get_shape(),
+            vec![batch_size, output_size],
+            "梯度形状不匹配: 期望 [{}, {}], 实际 {:?}",
+            batch_size,
+            output_size,
+            grad_output_2d.get_shape()
+        );
+
+        // 3. 计算权重的梯度: grad_weights = grad_output.T @ input
+        let grad_weights = grad_output_2d.transpose().matmul(&input_2d);
+
+        // 4. 计算偏置的梯度: grad_bias = 对grad_output按batch维度求和
+        // 初始化第一个样本的梯度
+        let mut grad_bias = Tensor::new(
+            vec![output_size],
+            grad_output_2d.get_data()[..output_size].to_vec()
+        );
+        // 累加其余样本的梯度
+        for i in 1..batch_size {
+            let start = i * output_size;
+            let end = start + output_size;
+            let sample_grad = Tensor::new(
+                vec![output_size],
+                grad_output_2d.get_data()[start..end].to_vec()
+            );
+            grad_bias = grad_bias.add(&sample_grad);
+        }
+
+        // 5. 计算输入的梯度: grad_input = grad_output @ weights
+        let grad_input = if batch_size == 1 {
+            self.matrix.transpose().matvec(&grad_output_2d.flatten())
+        } else {
+            grad_output_2d.matmul(&self.matrix)
+        };
+
+        // 6. 验证梯度形状
+        assert_eq!(
+            grad_weights.get_shape(),
+            self.matrix.get_shape(),
+            "权重梯度形状不匹配"
+        );
+        assert_eq!(
+            grad_bias.get_shape(),
+            self.bias.get_shape(),
+            "偏置梯度形状不匹配"
+        );
+
+        // 7. 如果输入是1维的,输出也应该是1维的
+        let grad_input_final = if input_tensor.get_shape().len() == 1 {
+            grad_input.flatten()
+        } else {
+            grad_input
+        };
+
+        // 8. 存储梯度
+        self.grad_matrix = Some(grad_weights);
+        self.grad_bias = Some(grad_bias);
+
+        grad_input_final
+    }
+
+    fn update(&mut self, learning_rate: T) {
+        if let Some(grad_matrix) = &self.grad_matrix {
+            // 更新权重矩阵: weights = weights - learning_rate * grad_weights
+            let scaled_grad_weights = grad_matrix.scalar_mul(&learning_rate);
+            self.matrix = self.matrix.sub(&scaled_grad_weights);
+        }
+        
+        if let Some(grad_bias) = &self.grad_bias {
+            // 更新偏置: bias = bias - learning_rate * grad_bias
+            let scaled_grad_bias = grad_bias.scalar_mul(&learning_rate);
+            self.bias = self.bias.sub(&scaled_grad_bias);
+        }
+    }
+
+    fn zero_grad(&mut self) {
+        self.grad_matrix = None;
+        self.grad_bias = None;
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -595,5 +728,137 @@ mod test {
         for i in 0..2 {
             assert_eq!(output.get_data()[i], padded_output.get_data()[i]);
         }
+    }
+
+    #[test]
+    fn test_dense_backward() {
+        // 创建Dense层: 2x3
+        let weights = Tensor::new(
+            vec![2, 3],
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+        let bias = Tensor::new(vec![2], vec![0.1f32, 0.2]);
+        let mut dense = Dense::new(weights, bias);
+
+        println!("\n=== Dense层参数 ===");
+        println!("权重矩阵:\n{:?}", dense.matrix.get_data());
+        println!("偏置向量: {:?}", dense.bias.get_data());
+
+        // 创建batch输入: 2x3 (两个样本)
+        let input = Tensor::new(
+            vec![2, 3],
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+        
+        println!("\n=== 输入数据 ===");
+        println!("输入形状: {:?}", input.get_shape());
+        println!("输入数据:\n{:?}", input.get_data());
+        
+        // batch的梯度: 2x2
+        let grad_output = Tensor::new(
+            vec![2, 2],
+            vec![1.0f32, 2.0, 3.0, 4.0]
+        );
+
+        println!("\n=== 输出梯度 ===");
+        println!("梯度形状: {:?}", grad_output.get_shape());
+        println!("梯度数据:\n{:?}", grad_output.get_data());
+
+        // 计算反向传播
+        let grad_input = dense.backward(&input, &grad_output);
+
+        println!("\n=== 反向传播结果 ===");
+        println!("输入梯度形状: {:?}", grad_input.get_shape());
+        println!("输入梯度:\n{:?}", grad_input.get_data());
+        println!("\n权重梯度形状: {:?}", dense.grad_matrix.as_ref().unwrap().get_shape());
+        println!("权重梯度:\n{:?}", dense.grad_matrix.as_ref().unwrap().get_data());
+        println!("\n偏置梯度形状: {:?}", dense.grad_bias.as_ref().unwrap().get_shape());
+        println!("偏置梯度: {:?}", dense.grad_bias.as_ref().unwrap().get_data());
+
+        // 验证梯度形状
+        assert_eq!(grad_input.get_shape(), vec![2, 3]);  // batch的输入梯度
+        assert_eq!(dense.grad_matrix.as_ref().unwrap().get_shape(), vec![2, 3]); // 权重梯度
+        assert_eq!(dense.grad_bias.as_ref().unwrap().get_shape(), vec![2]);      // 偏置梯度
+
+        // 验证梯度值
+        // 1. 输入梯度 = grad_output @ weights
+        let expected_grad_input = vec![9.0, 12.0, 15.0, 19.0, 26.0, 33.0];
+        println!("\n=== 验证结果 ===");
+        println!("期望的输入梯度: {:?}", expected_grad_input);
+        for (actual, expected) in grad_input.get_data().iter().zip(expected_grad_input.iter()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+
+        // 2. 权重梯度 = grad_output.T @ input
+        let expected_grad_weights = vec![13.0, 17.0, 21.0, 18.0, 24.0, 30.0];
+        println!("期望的权重梯度: {:?}", expected_grad_weights);
+        for (actual, expected) in dense.grad_matrix.as_ref().unwrap().get_data().iter().zip(expected_grad_weights.iter()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+
+        // 3. 偏置梯度 = sum(grad_output, axis=0)
+        let expected_grad_bias = vec![4.0, 6.0];
+        println!("期望的偏置梯度: {:?}", expected_grad_bias);
+        for (actual, expected) in dense.grad_bias.as_ref().unwrap().get_data().iter().zip(expected_grad_bias.iter()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_parameter_update() {
+        // 设置学习率
+        let learning_rate: f32 = 0.1;
+
+        // 初始化权重矩阵和偏置
+        let matrix = Tensor::new(
+            vec![2, 2],
+            vec![1.0f32, 2.0, 3.0, 4.0]
+        );
+        let bias = Tensor::new(
+            vec![2],
+            vec![1.0f32, 1.0]
+        );
+
+        // 初始化梯度
+        let grad_matrix = Tensor::new(
+            vec![2, 2],
+            vec![0.5f32, 0.5, 0.5, 0.5]
+        );
+        let grad_bias = Tensor::new(
+            vec![2],
+            vec![0.2f32, 0.2]
+        );
+
+        // 构建 Dense 层
+        let mut dense = Dense::new(matrix, bias);
+        dense.grad_matrix = Some(grad_matrix);
+        dense.grad_bias = Some(grad_bias);
+
+        println!("\n=== 更新前参数 ===");
+        println!("权重矩阵:\n{:?}", dense.matrix.get_data());
+        println!("偏置向量: {:?}", dense.bias.get_data());
+
+        // 执行参数更新
+        dense.update(learning_rate);
+
+        println!("\n=== 更新后参数 ===");
+        println!("权重矩阵:\n{:?}", dense.matrix.get_data());
+        println!("偏置向量: {:?}", dense.bias.get_data());
+
+        // 验证更新后的权重矩阵
+        let expected_matrix = vec![0.95f32, 1.95, 2.95, 3.95];
+        for (actual, expected) in dense.matrix.get_data().iter().zip(expected_matrix.iter()) {
+            assert!((actual - expected).abs() < 1e-5, 
+                "权重矩阵更新失败: 期望 {}, 实际 {}", expected, actual);
+        }
+
+        // 验证更新后的偏置
+        let expected_bias = vec![0.98f32, 0.98];
+        for (actual, expected) in dense.bias.get_data().iter().zip(expected_bias.iter()) {
+            assert!((actual - expected).abs() < 1e-5,
+                "偏置更新失败: 期望 {}, 实际 {}", expected, actual);
+        }
+
+        println!("test_parameter_update 测试通过");
     }
 }
