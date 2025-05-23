@@ -1453,4 +1453,63 @@ mod tests {
         }
         */
     }
+    // ... existing code ...
+    #[test]
+    fn test_forward_simple_compare() {
+        println!("\n=== 测试简单网络f32与Element对比 ===");
+        // 1. 模型参数设置
+        let input_dim = 4;
+        let hidden_dim = 3;
+        let output_dim = 2;
+        let weights1_data = vec![
+            0.1, 0.2, 0.3, 0.4,
+            0.5, 0.6, 0.7, 0.8,
+            0.9, 1.0, 1.1, 1.2
+        ];
+        let bias1_data = vec![0.1, 0.2, 0.3];
+        let weights2_data = vec![
+            0.1, 0.2, 0.3,
+            0.4, 0.5, 0.6
+        ];
+        let bias2_data = vec![0.1, 0.2];
+        let input_data = vec![3.0, 2.0, 3.0, 4.0];
+
+        // 2. 构建f32模型
+        let mut model = Model::<f32>::new(&vec![input_dim]);
+        let weights1 = Tensor::<f32>::new(vec![hidden_dim, input_dim], weights1_data.clone());
+        let bias1 = Tensor::<f32>::new(vec![hidden_dim], bias1_data.clone());
+        model.add_layer(Layer::Dense(Dense::<f32>::new(weights1, bias1)));
+        model.add_layer(Layer::Activation(Activation::Relu(Relu::new())));
+        let weights2 = Tensor::<f32>::new(vec![output_dim, hidden_dim], weights2_data.clone());
+        let bias2 = Tensor::<f32>::new(vec![output_dim], bias2_data.clone());
+        model.add_layer(Layer::Dense(Dense::<f32>::new(weights2, bias2)));
+
+        // 3. f32模型推理
+        let input_f32 = Tensor::<f32>::new(vec![input_dim], input_data.clone());
+        let (f32_output, _) = model.forward_with_intermediates(&input_f32);
+        println!("\n[f32模型最终输出]: {:?}", f32_output.get_data());
+
+        // 4. 量化为Element模型
+        let strategy = AbsoluteMax::new();
+        let (quantized_model, metadata) = strategy.quantize(model).unwrap();
+        let input_element = Tensor::<Element>::new(vec![input_dim], input_data.iter().map(|&x| x as i128).collect());
+        let (element_output, _) = quantized_model.forward_with_intermediates(&input_element);
+        println!("[Element模型最终输出(整数)]: {:?}", element_output.get_data());
+        let deq_output = element_output.dequantize(&metadata.output_layers_scaling.get(&2).unwrap());
+        println!("[Element模型最终输出(反量化f32)]: {:?}", deq_output.get_data());
+
+        // 比例关系与损失分析
+        let f32_vals = f32_output.get_data();
+        let elem_vals = element_output.get_data();
+        if f32_vals.len() == elem_vals.len() && !f32_vals.is_empty() {
+            for i in 0..f32_vals.len() {
+                let ratio = elem_vals[i] as f64 / f32_vals[i] as f64;
+                let diff = elem_vals[i] as f64 - f32_vals[i] as f64;
+                println!("[对比] 输出{}: f32 = {:.6}, element = {}, 比例 = {:.6}, 差值 = {:.6}", i, f32_vals[i], elem_vals[i], ratio, diff);
+            }
+        }
+        // 打印metadata信息
+        println!("[Meta] input scaling: {:?}", metadata.input);
+        println!("[Meta] output_layers_scaling: {:?}", metadata.output_layers_scaling);
+    }
 }
